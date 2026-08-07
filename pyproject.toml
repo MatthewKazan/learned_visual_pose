@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "visual-pose"
+version = "0.1.0"
+description = "Learned visual correspondence and geometric pose estimation"
+requires-python = ">=3.11"
+
+dependencies = [
+    "numpy",
+    "torch",
+    "torchvision",
+    "pillow",
+    "pyyaml",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+where = ["python"]
