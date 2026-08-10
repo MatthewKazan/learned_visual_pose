@@ -5,6 +5,9 @@
 
 namespace geometry {
 
+  Eigen::Matrix3d hat(const Eigen::Vector3d& w);
+  Eigen::Vector3d vee(const Eigen::Matrix3d& W);
+
   class RotationSO3 {
   public:
     RotationSO3() : R_(Eigen::Matrix3d::Identity()) {}

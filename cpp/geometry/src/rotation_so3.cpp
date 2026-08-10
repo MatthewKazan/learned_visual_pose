@@ -4,6 +4,18 @@
 
 namespace geometry {
 
+  Eigen::Matrix3d hat(const Eigen::Vector3d& w) {
+    Eigen::Matrix3d W;
+    W <<  0.0,   -w.z(),  w.y(),
+          w.z(),  0.0,   -w.x(),
+         -w.y(),  w.x(),  0.0;
+    return W;
+  }
+
+  Eigen::Vector3d vee(const Eigen::Matrix3d& W) {
+    return Eigen::Vector3d(W(2, 1), W(0, 2), W(1, 0));
+  }
+
   RotationSO3::RotationSO3(const Eigen::Matrix3d& R) {
     auto identity_check = R.transpose() * R;
     if (!identity_check.isIdentity(1e-6)
@@ -25,12 +37,7 @@ namespace geometry {
    * @return Rotation matrix in SO3
    */
   RotationSO3 RotationSO3::exp(const Eigen::Vector3d& omega) {
-    // construct skew symmetric metrix from axis angle omega
-    Eigen::Matrix3d omega_skew;
-    omega_skew << 0.0,       -omega.z(),  omega.y(),
-                  omega.z(),  0.0,       -omega.x(),
-                  -omega.y(), omega.x(),  0.0;
-
+    const Eigen::Matrix3d omega_skew = hat(omega);
     const double theta = omega.norm();
     const double theta2 = theta * theta;
 
@@ -64,12 +71,7 @@ namespace geometry {
 
     if (theta < 1e-6) {
       // b/c when theta close to 0 -> theta / 2 * sin(theta) ~= 1/2
-      const Eigen::Matrix3d omega_skew = 0.5 * (R_ - R_.transpose());
-      return Eigen::Vector3d(
-          omega_skew(2, 1),
-          omega_skew(0, 2),
-          omega_skew(1, 0)
-      );
+      return vee(0.5 * (R_ - R_.transpose()));
     }
 
     // TODO: dont fully understand this part yet
@@ -91,20 +93,10 @@ namespace geometry {
       axis(i) = M(k, i) / axis(k);
       axis(j) = M(k, j) / axis(k);
 
-      // Sign of axis is inherently ambiguous at theta = pi
-      // (pi * omega and -pi * omega represent the same rotation).
       return theta * axis;
     }
 
-    const Eigen::Matrix3d omega_skew =
-        theta / (2.0 * std::sin(theta))
-        * (R_ - R_.transpose());
-
-    return Eigen::Vector3d(
-        omega_skew(2, 1),
-        omega_skew(0, 2),
-        omega_skew(1, 0)
-    );
+    return vee(theta / (2.0 * std::sin(theta)) * (R_ - R_.transpose()));
   }
   RotationSO3 RotationSO3::inverse() const {
     return fromValidMatrix(R_.transpose());

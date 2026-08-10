@@ -196,3 +196,23 @@ TEST(GeometryTest, PreservesInnerProduct) {
     const Eigen::Vector3d v(4, -5, 6);
     EXPECT_NEAR((r * u).dot(r * v), u.dot(v), 1e-12);
 }
+
+TEST(GeometryTest, HatTranspose) {
+    const Eigen::Vector3d w(1, 2, 3);
+    const Eigen::Matrix3d W = geometry::hat(w);
+    EXPECT_TRUE(W.transpose().isApprox(-1 * W));
+}
+
+TEST(GeometryTest, HatCross) {
+    const Eigen::Vector3d w(1, 3, 7);
+    const Eigen::Matrix3d W = geometry::hat(w);
+    const Eigen::Vector3d u(1, 2, 3);
+    EXPECT_TRUE((W * u).isApprox(w.cross(u)));
+}
+
+TEST(GeometryTest, HatVeeRoundTrip) {
+    const Eigen::Vector3d w(1, 2, 3);
+    const Eigen::Matrix3d W = geometry::hat(w);
+    const Eigen::Vector3d v = geometry::vee(W);
+    EXPECT_TRUE(v.isApprox(w));
+}
