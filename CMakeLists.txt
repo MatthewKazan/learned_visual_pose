@@ -19,6 +19,25 @@ enable_testing()
 
 find_package(Eigen3 REQUIRED)
 
+add_library(
+    geometry
+    cpp/geometry/include/rotation_so3.hpp
+    cpp/geometry/src/rotation_so3.cpp
+    cpp/geometry/include/geometry.hpp
+)
+
+target_include_directories(
+    geometry
+    PUBLIC
+      cpp/geometry/include
+)
+
+target_link_libraries(
+    geometry
+    PUBLIC
+      Eigen3::Eigen
+)
+
 add_executable(
     learned_visual_pose
     cpp/app/main.cpp
@@ -27,7 +46,7 @@ add_executable(
 target_link_libraries(
     learned_visual_pose
     PRIVATE
-      Eigen3::Eigen
+      geometry
 )
 
 add_executable(
@@ -39,7 +58,7 @@ target_link_libraries(
     unit_tests
     PRIVATE
       GTest::gtest_main
-      Eigen3::Eigen
+      geometry
 )
 
 include(GoogleTest)
