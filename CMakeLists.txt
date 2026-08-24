@@ -29,6 +29,8 @@ add_library(
     cpp/geometry/include/utils.hpp
     cpp/geometry/include/pinhole_camera.hpp
     cpp/geometry/src/pinhole_camera.cpp
+    cpp/geometry/include/pixel_to_pose.hpp
+    cpp/geometry/src/pixel_to_pose.cpp
 )
 
 target_include_directories(
@@ -59,6 +61,7 @@ add_executable(
     cpp/tests/test_rotation_so3.cpp
     cpp/tests/test_pose_se3.cpp
     cpp/tests/test_pinhole_camera.cpp
+    cpp/tests/test_pixel_to_pose.cpp
 )
 
 target_link_libraries(
@@ -70,3 +73,4 @@ target_link_libraries(
 
 include(GoogleTest)
 gtest_discover_tests(unit_tests)
+
