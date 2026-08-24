@@ -24,6 +24,11 @@ add_library(
     cpp/geometry/include/rotation_so3.hpp
     cpp/geometry/src/rotation_so3.cpp
     cpp/geometry/include/geometry.hpp
+    cpp/geometry/include/pose_se3.hpp
+    cpp/geometry/src/pose_se3.cpp
+    cpp/geometry/include/utils.hpp
+    cpp/geometry/include/pinhole_camera.hpp
+    cpp/geometry/src/pinhole_camera.cpp
 )
 
 target_include_directories(
@@ -51,7 +56,9 @@ target_link_libraries(
 
 add_executable(
     unit_tests
-    cpp/tests/test_sanity.cpp
+    cpp/tests/test_rotation_so3.cpp
+    cpp/tests/test_pose_se3.cpp
+    cpp/tests/test_pinhole_camera.cpp
 )
 
 target_link_libraries(

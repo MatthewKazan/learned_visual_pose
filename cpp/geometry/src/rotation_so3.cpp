@@ -1,20 +1,7 @@
 #include "rotation_so3.hpp"
-
-#include <Eigen/LU>
+#include "utils.hpp"
 
 namespace geometry {
-
-  Eigen::Matrix3d hat(const Eigen::Vector3d& w) {
-    Eigen::Matrix3d W;
-    W <<  0.0,   -w.z(),  w.y(),
-          w.z(),  0.0,   -w.x(),
-         -w.y(),  w.x(),  0.0;
-    return W;
-  }
-
-  Eigen::Vector3d vee(const Eigen::Matrix3d& W) {
-    return Eigen::Vector3d(W(2, 1), W(0, 2), W(1, 0));
-  }
 
   RotationSO3::RotationSO3(const Eigen::Matrix3d& R) {
     auto identity_check = R.transpose() * R;
@@ -39,23 +26,11 @@ namespace geometry {
   RotationSO3 RotationSO3::exp(const Eigen::Vector3d& omega) {
     const Eigen::Matrix3d omega_skew = hat(omega);
     const double theta = omega.norm();
-    const double theta2 = theta * theta;
 
-    double sin_over_theta;
-    double one_minus_cos_over_theta2;
-
-    if (theta > 1e-6) {
-      sin_over_theta = std::sin(theta) / theta;
-      one_minus_cos_over_theta2 =
-          (1.0 - std::cos(theta)) / theta2;
-    } else {
-      // use taylor expansion when close to 0
-      sin_over_theta = 1.0 - theta2 / 6.0;
-      one_minus_cos_over_theta2 =
-          0.5 - theta2 / 24.0;
-    }
-
-    const Eigen::Matrix3d R = Eigen::Matrix3d::Identity() + sin_over_theta * omega_skew + one_minus_cos_over_theta2 * omega_skew * omega_skew;
+    const Eigen::Matrix3d R =
+        Eigen::Matrix3d::Identity()
+        + sin_over_theta(theta) * omega_skew
+        + one_minus_cos_over_theta2(theta) * omega_skew * omega_skew;
 
     return fromValidMatrix(R);
   }

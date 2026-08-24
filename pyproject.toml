@@ -15,12 +15,15 @@ dependencies = [
     "pillow",
     "pyyaml",
     "matplotlib",
+    "scipy",            # Rotation.from_quat in data_utils.dataset
+    "opencv-python",    # imread / cvtColor in data_utils.dataset
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest",
     "ruff",
+    "optuna",           # experiments.sweep
 ]
 
 [tool.setuptools.packages.find]
