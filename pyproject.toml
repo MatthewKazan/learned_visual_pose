@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=69"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "visual-pose"
@@ -24,7 +24,25 @@ dev = [
     "pytest",
     "ruff",
     "optuna",           # experiments.sweep
+    "pybind11-stubgen", # regenerate _geometry.pyi after changing bindings:
+                        #   pybind11-stubgen visual_pose._geometry -o python/
+    "pybind11>=2.12",   # also here, not just build-system: CLion configures
+                        # outside pip's isolated build env and needs
+                        # -Dpybind11_DIR=$(.venv/bin/python -m pybind11 --cmakedir)
 ]
 
-[tool.setuptools.packages.find]
-where = ["python"]
+[tool.scikit-build]
+# Package lives under python/, not the repo root, so this must be explicit.
+wheel.packages = ["python/visual_pose"]
+# Debug so the .so carries symbols and CLion can break inside C++ called from
+# Python. Override at deploy time with SKBUILD_CMAKE_BUILD_TYPE=Release.
+cmake.build-type = "Debug"
+build-dir = "build/{wheel_tag}"
+
+[tool.scikit-build.editable]
+# rebuild=true recompiles on import, so editing C++ needs no reinstall. It adds
+# a CMake no-op check (~1s) to every interpreter start; set false if that grates.
+mode = "redirect"
+rebuild = true
+verbose = false
+

@@ -12,7 +12,6 @@ always traceable to what produced it.
 """
 from dataclasses import dataclass, fields, asdict
 from pathlib import Path
-import argparse
 
 from visual_pose.data_utils.constants import REPO_DIR
 

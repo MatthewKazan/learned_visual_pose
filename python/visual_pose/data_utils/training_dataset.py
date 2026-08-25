@@ -1,13 +1,11 @@
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from pathlib import Path
-from torch.utils.data import DataLoader
 
 from torchvision.transforms import ColorJitter
 
 from visual_pose.data_utils.dataset import TartanAirSequence
-from visual_pose.geometry.correspondences import generate_correspondences
+from visual_pose.geometry.true_correspondences import generate_correspondences
 from visual_pose.data_utils.constants import INTRINSICS_TARTAN_AIR, REPO_DIR
 
 
