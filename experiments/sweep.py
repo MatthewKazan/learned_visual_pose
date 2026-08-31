@@ -33,9 +33,8 @@ from torch.utils.data import DataLoader, Subset
 from visual_pose.config import Config
 from visual_pose.data_utils.constants import DEVICE, REPO_DIR
 from visual_pose.models.descriptor_cnn import DescriptorCNN
-from visual_pose.models.training import (train_val_model, set_up_loss_optimizer_lr_scheduler,
+from visual_pose.training import (train_val_model, set_up_loss_optimizer_lr_scheduler,
                                          test_model, mma)
-from visual_pose.train import build_loaders
 
 # Cheap stand-in for the real problem.
 # P000 (bright indoor hospital) + P006 (dark japanese alley) keeps the

@@ -11,6 +11,8 @@ INTRINSICS_TARTAN_AIR = np.array([
     [0.0, 0.0, 1.0],
 ], dtype=np.float32)
 
+SIMILARITY_THRESHOLD = 0.7
+
 def _pick_device() -> torch.device:
     # TORCH_DEVICE=cpu is the escape hatch: two processes holding Metal contexts
     # at once has already aborted a training run mid-epoch, so anything run

@@ -10,41 +10,12 @@ import json
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, ConcatDataset
 
 from visual_pose.config import Config
-from visual_pose.data_utils.constants import DEVICE, REPO_DIR
-from visual_pose.data_utils.dataset import TartanAirSequence
-from visual_pose.data_utils.training_dataset import TACorrespondenceDataset
+from visual_pose.data_utils.constants import DEVICE
+from visual_pose.data_utils.loaders import build_loaders
 from visual_pose.models.descriptor_cnn import DescriptorCNN
-from visual_pose.models.training import train_val_model, set_up_loss_optimizer_lr_scheduler
-
-
-def build_loaders(cfg: Config):
-    root = REPO_DIR / "data" / "tartan_air"
-    common = dict(num_correspondences=cfg.num_correspondences,
-                  sample_step=cfg.sample_step,
-                  darkness_threshold=cfg.darkness_threshold,
-                  max_depth=cfg.max_depth,
-                  occlusion_tol=cfg.occlusion_tol)
-
-    # augment on train only -- val has to stay a fixed yardstick
-    train_dataset = ConcatDataset([
-        TACorrespondenceDataset(TartanAirSequence(root / name),
-                                frame_gap=list(cfg.frame_gap), augment=True,
-                                jitter=cfg.jitter, **common)
-        for name in cfg.train_sequences
-    ])
-    val_dataset = TACorrespondenceDataset(TartanAirSequence(root / cfg.val_sequence),
-                                          frame_gap=cfg.val_frame_gap, eval=True, **common)
-
-    # persistent_workers keeps workers alive across epochs. On macOS they are
-    # spawned, not forked, so otherwise every epoch re-imports torch in each one.
-    loader = dict(batch_size=cfg.batch_size, num_workers=cfg.num_workers,
-                  persistent_workers=cfg.num_workers > 0,
-                  pin_memory=(DEVICE.type == "cuda"))
-    return (DataLoader(train_dataset, shuffle=True, **loader),
-            DataLoader(val_dataset, shuffle=False, **loader))
+from visual_pose.training import train_val_model, set_up_loss_optimizer_lr_scheduler
 
 
 def main(cfg: Config | None = None):
@@ -71,14 +42,7 @@ def main(cfg: Config | None = None):
     print(f"train {len(train_loader.dataset)} pairs / {len(train_loader)} batches, "
           f"val {len(val_loader.dataset)} pairs\n")
 
-    model = DescriptorCNN(
-        body_channels=list(cfg.body_channels),
-        body_kernel_sizes=list(cfg.body_kernel_sizes),
-        body_strides=list(cfg.body_strides),
-        body_dilations=list(cfg.body_dilations),
-        descriptor_dim=cfg.descriptor_dim,
-        norm=cfg.norm,
-    ).to(DEVICE)
+    model = DescriptorCNN.from_config(cfg).to(DEVICE)
 
     loss_fn, optimizer, lr_scheduler = set_up_loss_optimizer_lr_scheduler(
         model=model,

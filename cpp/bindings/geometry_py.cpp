@@ -11,6 +11,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/eigen.h>
 #include <pybind11/operators.h>
+#include <pybind11/stl.h>   // RansacFit::inliers is a std::vector
 
 #include "geometry.hpp"
 #include "pixel_to_pose.hpp"
@@ -25,6 +26,22 @@ PYBIND11_MODULE(_geometry, m) {
   m.def("vee", &vee, py::arg("W"));
 
   m.def("eight_point_algorithm", &camera::eight_point_algorithm, py::arg("ray_i"), py::arg("ray_j"));
+
+  py::class_<camera::KabschFit>(m, "KabschFit")
+      .def_readonly("T_ji", &camera::KabschFit::T_ji)
+      .def_readonly("degeneracy", &camera::KabschFit::degeneracy);
+
+  py::class_<camera::RansacFit>(m, "RansacFit")
+      .def_readonly("T_ji", &camera::RansacFit::T_ji)
+      .def_readonly("inliers", &camera::RansacFit::inliers)
+      .def_readonly("inlier_ratio", &camera::RansacFit::inlier_ratio);
+
+  m.def("kabsch_algorithm", &camera::kabsch_algorithm, py::arg("point_i"), py::arg("point_j"));
+  m.def("kabsch_ransac", &camera::kabsch_ransac, py::arg("point_i"), py::arg("point_j"),
+        py::arg("inlier_threshold") = 0.05, py::arg("degeneracy_threshold") = 1e-3);
+  m.def("set_seed", &camera::set_seed, py::arg("seed"));
+
+
 
   py::class_<RotationSO3>(m, "RotationSO3")
       .def(py::init<>())

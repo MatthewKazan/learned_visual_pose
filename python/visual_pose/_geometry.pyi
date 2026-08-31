@@ -5,7 +5,14 @@ from __future__ import annotations
 import numpy
 import numpy.typing
 import typing
-__all__: list[str] = ['PinholeCamera', 'PoseSE3', 'RotationSO3', 'eight_point_algorithm', 'hat', 'vee']
+__all__: list[str] = ['KabschFit', 'PinholeCamera', 'PoseSE3', 'RansacFit', 'RotationSO3', 'eight_point_algorithm', 'hat', 'kabsch_algorithm', 'kabsch_ransac', 'set_seed', 'vee']
+class KabschFit:
+    @property
+    def T_ji(self) -> typing.Annotated[numpy.typing.NDArray[numpy.float64], "[4, 4]"]:
+        ...
+    @property
+    def degeneracy(self) -> float:
+        ...
 class PinholeCamera:
     @typing.overload
     def __init__(self, fx: typing.SupportsFloat | typing.SupportsIndex, fy: typing.SupportsFloat | typing.SupportsIndex, cx: typing.SupportsFloat | typing.SupportsIndex, cy: typing.SupportsFloat | typing.SupportsIndex) -> None:
@@ -62,6 +69,16 @@ class PoseSE3:
         ...
     def translation(self) -> typing.Annotated[numpy.typing.NDArray[numpy.float64], "[3, 1]"]:
         ...
+class RansacFit:
+    @property
+    def T_ji(self) -> typing.Annotated[numpy.typing.NDArray[numpy.float64], "[4, 4]"]:
+        ...
+    @property
+    def inlier_ratio(self) -> float:
+        ...
+    @property
+    def inliers(self) -> list[int]:
+        ...
 class RotationSO3:
     @staticmethod
     def exp(omega: typing.Annotated[numpy.typing.ArrayLike, numpy.float64, "[3, 1]"]) -> RotationSO3:
@@ -89,6 +106,12 @@ class RotationSO3:
 def eight_point_algorithm(ray_i: typing.Annotated[numpy.typing.ArrayLike, numpy.float64, "[m, 3]"], ray_j: typing.Annotated[numpy.typing.ArrayLike, numpy.float64, "[m, 3]"]) -> typing.Annotated[numpy.typing.NDArray[numpy.float64], "[3, 3]"]:
     ...
 def hat(w: typing.Annotated[numpy.typing.ArrayLike, numpy.float64, "[3, 1]"]) -> typing.Annotated[numpy.typing.NDArray[numpy.float64], "[3, 3]"]:
+    ...
+def kabsch_algorithm(point_i: typing.Annotated[numpy.typing.ArrayLike, numpy.float64, "[m, 3]"], point_j: typing.Annotated[numpy.typing.ArrayLike, numpy.float64, "[m, 3]"]) -> KabschFit:
+    ...
+def kabsch_ransac(point_i: typing.Annotated[numpy.typing.ArrayLike, numpy.float64, "[m, 3]"], point_j: typing.Annotated[numpy.typing.ArrayLike, numpy.float64, "[m, 3]"], inlier_threshold: typing.SupportsFloat | typing.SupportsIndex = 0.05, degeneracy_threshold: typing.SupportsFloat | typing.SupportsIndex = 0.001) -> RansacFit:
+    ...
+def set_seed(seed: typing.SupportsInt | typing.SupportsIndex) -> None:
     ...
 def vee(W: typing.Annotated[numpy.typing.ArrayLike, numpy.float64, "[3, 3]"]) -> typing.Annotated[numpy.typing.NDArray[numpy.float64], "[3, 1]"]:
     ...

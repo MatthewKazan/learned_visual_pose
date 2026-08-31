@@ -75,6 +75,17 @@ class DescriptorCNN(nn.Module):
             nn.ReLU(inplace=True),
         )
 
+    @classmethod
+    def from_config(cls, cfg):
+        return cls(
+            body_channels=cfg.body_channels,
+            body_kernel_sizes=cfg.body_kernel_sizes,
+            body_strides=cfg.body_strides,
+            body_dilations=cfg.body_dilations,
+            descriptor_dim=cfg.descriptor_dim,
+            norm=cfg.norm,
+        )
+
     def forward(self, x):
         """
         x: (B, 3, H, W) RGB image, values in [0, 1]

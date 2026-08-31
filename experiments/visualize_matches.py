@@ -2,7 +2,7 @@
 Visual check on descriptor quality: untrained vs trained, side by side.
 
     python -m experiments.visualize_matches
-    python -m experiments.visualize_matches --checkpoint checkpoints/last.pt --pair 120
+    python -m experiments.visualize_matches --run-name k7_d122_mma70 --pair 120
 
 Three views, each answering a different question:
 
@@ -26,8 +26,6 @@ Three views, each answering a different question:
      flat colour = collapsed. Pure noise = no spatial structure learned.
 """
 import argparse
-import json
-from pathlib import Path
 
 import cv2
 import matplotlib.pyplot as plt
@@ -35,13 +33,15 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
+from visual_pose.checkpoints import load_model
 from visual_pose.config import Config
 from visual_pose.data_utils.constants import DEVICE, REPO_DIR
 from visual_pose.data_utils.dataset import TartanAirSequence
 from visual_pose.data_utils.training_dataset import TACorrespondenceDataset
+from visual_pose.geometry.best_match import best_match
+from visual_pose.matching import descriptors_at, mma
 from visual_pose.models.descriptor_cnn import DescriptorCNN
 from visual_pose.models.sift import SIFT
-from visual_pose.models.training import descriptors_at, mma
 
 TAU = 8.0          # "correct" threshold in pixels, matches the stride
 N_LINES = 40       # correspondences to draw; more than this is unreadable
@@ -66,56 +66,32 @@ def most_textured_pair(seq, dataset, stride=10):
     return best_idx
 
 
-def load_model(checkpoint=None):
-    """
-    Build the architecture recorded beside the checkpoint, not DescriptorCNN's
-    defaults -- a kernel-7 checkpoint will not load into a kernel-3 model, and
-    the sweep moved the architecture well away from the class defaults.
-    """
-    cfg = Config()
-    if checkpoint is not None:
-        cfg_path = Path(checkpoint).parent / "config.json"
-        if cfg_path.exists():
-            saved = json.loads(cfg_path.read_text())
-            cfg = Config(**{k: tuple(v) if isinstance(v, list) else v
-                            for k, v in saved.items()})
-
-    model = DescriptorCNN(
-        body_channels=list(cfg.body_channels),
-        body_kernel_sizes=list(cfg.body_kernel_sizes),
-        body_strides=list(cfg.body_strides),
-        body_dilations=list(cfg.body_dilations),
-        descriptor_dim=cfg.descriptor_dim,
-        norm=cfg.norm,
-    ).to(DEVICE).eval()
-
-    if checkpoint is not None:
-        state = torch.load(checkpoint, map_location=DEVICE, weights_only=False)
-        model.load_state_dict(state["model"])
-        print(f"loaded {checkpoint}  (epoch {state['epoch'] + 1}, "
-              f"val_mma {state['val_mma']:.2%}, kernels {cfg.body_kernel_sizes} "
-              f"dilations {cfg.body_dilations})")
-    return model
-
-
 @torch.no_grad()
 def analyse(model, batch):
     """Everything the plots need, for one batch of size 1."""
     images_i, images_j = batch["rgb_i"], batch["rgb_j"]
     uvs_i, uvs_j = batch["uv_i"], batch["uv_j"]
+    image_shape = tuple(images_j.shape[2:])
 
-    queries, _ = descriptors_at(model, images_i, uvs_i)      # (1, N, D)
-    feature_j = model(images_j)                              # (1, D, H', W')
-    Hf, Wf = feature_j.shape[2], feature_j.shape[3]
-    candidates = feature_j.permute(0, 2, 3, 1).flatten(1, 2)  # (1, M, D)
+    queries, feature_i = descriptors_at(model, images_i, uvs_i)   # (1,N,D), (1,D,H',W')
+    feature_j = model(images_j)                                   # (1,D,H',W')
 
+    # Predictions come from best_match itself rather than a local reimplementation.
+    # The version that used to live here carried its own cell->pixel arithmetic,
+    # so it kept the pre-align_corners convention after best_match moved off it --
+    # a figure that disagreed with the pipeline by half a cell and said nothing.
+    predicted, _, _ = best_match(
+        query_descriptors_i=queries,
+        descriptors_j=feature_j,
+        image_shape=image_shape,
+    )                                                             # (1, N, 2)
+
+    # best_match returns only the winner; the heatmap needs the whole row. N is a
+    # few hundred against M=4800, so recomputing beats plumbing it out of there.
+    candidates = feature_j.permute(0, 2, 3, 1).flatten(1, 2)       # (1, M, D)
     similarity = torch.matmul(queries, candidates.transpose(-1, -2))  # (1, N, M)
-    best = similarity.argmax(dim=-1)                                  # (1, N)
 
-    stride_u = images_j.shape[3] / Wf
-    stride_v = images_j.shape[2] / Hf
-    predicted = torch.stack([(best % Wf) * stride_u, (best // Wf) * stride_v], dim=-1)
-    error = torch.linalg.vector_norm(predicted - uvs_j, dim=-1)        # (1, N)
+    error = torch.linalg.vector_norm(predicted - uvs_j, dim=-1)   # (1, N)
 
     return {
         "uv_i": uvs_i[0].cpu(),
@@ -123,9 +99,9 @@ def analyse(model, batch):
         "predicted": predicted[0].cpu(),
         "error": error[0].cpu(),
         "similarity": similarity[0].cpu(),   # (N, M)
-        "feature_i": model(images_i)[0].cpu(),
+        "feature_i": feature_i[0].cpu(),
         "feature_j": feature_j[0].cpu(),
-        "shape": (Hf, Wf),
+        "shape": tuple(feature_j.shape[2:]),
     }
 
 
@@ -205,8 +181,11 @@ def draw_pca(ax, res, title):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", default=str(REPO_DIR / "checkpoints" / "best.pt"))
-    ap.add_argument("--sequence", default="P003", help="held-out sequence to visualise")
+    ap.add_argument("--run-name", default="k7_d122_mma70",
+                    help="checkpoints/<run-name>/ -- also selects the architecture")
+    ap.add_argument("--checkpoint", default="best.pt", help="file inside the run directory")
+    ap.add_argument("--sequence", default=None,
+                    help="held-out sequence to visualise (default: cfg.val_sequence)")
     ap.add_argument("--pair", type=int, default=None,
                     help="which frame pair (default: auto-pick the most textured one)")
     ap.add_argument("--query", type=int, default=None,
@@ -217,8 +196,15 @@ def main():
     args = ap.parse_args()
 
     torch.manual_seed(0)
-    seq = TartanAirSequence(REPO_DIR / "data" / "tartan_air" / args.sequence)
-    dataset = TACorrespondenceDataset(seq)
+
+    # The config drives BOTH the checkpoint directory and the architecture, which
+    # is what stops a kernel-7 checkpoint being loaded into a kernel-3 model.
+    cfg = Config()
+    cfg.run_name = args.run_name
+    sequence = args.sequence or cfg.val_sequence
+
+    seq = TartanAirSequence(REPO_DIR / "data" / "tartan_air" / sequence)
+    dataset = TACorrespondenceDataset(seq, sample_step=cfg.sample_step)
 
     if args.pair is None:
         args.pair = most_textured_pair(seq, dataset)
@@ -231,9 +217,9 @@ def main():
     # (B,3,H,W) -> (B,D,H',W') on the same grid. Same queries, same candidate
     # pool, same metric -- only the descriptor differs.
     builders = {
-        "SIFT": lambda: SIFT(step=dataset.sample_step),
-        "untrained": lambda: load_model(None),
-        "trained": lambda: load_model(args.checkpoint),
+        "SIFT": lambda: SIFT(step=cfg.sample_step),
+        "untrained": lambda: DescriptorCNN.from_config(cfg).to(DEVICE).eval(),
+        "trained": lambda: load_model(cfg, args.checkpoint).eval(),
     }
     models = {}
     for name in [n.strip() for n in args.models.split(",")]:
@@ -262,7 +248,7 @@ def main():
         draw_heatmap(axes[1][col], img_j, res, query_n, f"[{name}] similarity, query #{query_n}")
         draw_pca(axes[2][col], res, f"[{name}] descriptor structure")
 
-    fig.suptitle(f"{args.sequence}  pair {args.pair}  "
+    fig.suptitle(f"{sequence}  pair {args.pair}  "
                  f"(frames {dataset.pairs[args.pair][0]} -> {dataset.pairs[args.pair][1]})",
                  fontsize=12)
     fig.tight_layout()

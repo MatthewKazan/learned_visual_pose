@@ -6,7 +6,7 @@ Run: python -m experiments.check_bilinear
 import torch
 from torch.nn import functional as F
 
-from visual_pose.models.training import bilinear_sample
+from visual_pose.matching import bilinear_sample
 
 
 def reference(descriptor, feature_uvs):

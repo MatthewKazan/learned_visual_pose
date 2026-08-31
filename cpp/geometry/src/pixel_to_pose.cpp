@@ -1,5 +1,8 @@
 #include "pixel_to_pose.hpp"
 
+#include <random>
+#include <unordered_set>
+
 #include "pinhole_camera.hpp"
 
 namespace geometry::camera {
@@ -31,4 +34,172 @@ namespace geometry::camera {
 
     return E;
   }
+
+  KabschFit kabsch_algorithm(const Eigen::MatrixX3d &point_i, const Eigen::MatrixX3d &point_j) {
+    // Minimizes sum_k ||pj_k - (R pi_k + t)||^2. Returns T_ji: maps frame-i points into frame j.
+    //
+    // t separates exactly: the optimum maps centroid to centroid, t = mean_j - R mean_i,
+    // so center both clouds and solve for R alone. Rotations preserve norms, so minimizing
+    // the centered sum = maximizing sum_k pj'^T R pi', and via a^T M b = tr(M b a^T):
+    //   maximize tr(R H),  H = sum_k pi'_k pj'_k^T  (outer product -- 3x3, not the scalar)
+    // H = U S V^T gives tr(RH) = tr(M S) with M = V^T R U orthogonal, so |M_ii| <= 1 and
+    // the max is M = I  ->  R = V U^T. Closed form, global optimum, no initial guess.
+    //
+    // det(V U^T) can be -1 (a mirror fits at least as well whenever sigma3 is weak --
+    // routine on planar scenes). Fix flips only the smallest-sigma axis, diag(1,1,-1) with
+    // JacobiSVD's descending sort. Negating the whole matrix also lands on det +1 but is a
+    // ~180deg wrong rotation -- that bug shipped here once.
+    //
+    // Sigma diagnostics: sigma3 = 0 (coplanar) is fine -- handedness pins the third axis.
+    // sigma2 ~ 0 (collinear) leaves rotation about the line undetermined.
+
+    const Eigen::Vector3d mean_i = point_i.colwise().mean();
+    const Eigen::Vector3d mean_j = point_j.colwise().mean();
+
+    const Eigen::MatrixX3d pi_c = point_i.rowwise() - mean_i.transpose();
+    const Eigen::MatrixX3d pj_c = point_j.rowwise() - mean_j.transpose();
+
+    const Eigen::Matrix3d H = pi_c.transpose() * pj_c;
+
+    const Eigen::JacobiSVD<Eigen::Matrix3d> svdH(H, Eigen::ComputeFullV | Eigen::ComputeFullU);
+    const Eigen::Matrix3d U = svdH.matrixU();
+    const Eigen::Matrix3d V = svdH.matrixV();
+    Eigen::Matrix3d R = V * U.transpose();
+
+    if (auto det = R.determinant(); det < 0.0) {
+      Eigen::Matrix3d diag = Eigen::Matrix3d::Identity();
+      diag(2,2) = -1.0;
+      R = V * diag * U.transpose();
+    }
+
+    //                         3x1    3x3   3x1
+    const Eigen::Vector3d t = mean_j - R * mean_i;
+    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+    T.block<3,3>(0,0) = R;
+    T.block<3,1>(0,3) = t;
+
+    return {T, svdH.singularValues()(1) / svdH.singularValues()(0)};
+  }
+
+  // Function-local static: one generator for the whole library, fixed initial
+  // state so runs replay. set_seed() is the only way to move it.
+  static std::mt19937 &generator() {
+    static std::mt19937 rng(0);
+    return rng;
+  }
+
+  void set_seed(const unsigned seed) { generator().seed(seed); }
+
+  static std::vector<Eigen::Index> random_points(const Eigen::Index num_points,
+                                                 const int min_sample_size) {
+    if (min_sample_size > num_points)
+      throw std::invalid_argument("min_sample_size > num_points");
+    std::uniform_int_distribution<size_t> dist(0, num_points - 1);
+    std::unordered_set<Eigen::Index> idx;
+    idx.reserve(min_sample_size);
+
+    while (idx.size() < static_cast<size_t>(min_sample_size)) {
+      idx.insert(dist(generator()));
+    }
+
+    return std::vector<Eigen::Index>(idx.begin(), idx.end());
+  }
+
+  std::vector<Eigen::Index> inlier_indices(const Eigen::MatrixX3d &point_i, const Eigen::MatrixX3d &point_j, const Eigen::Matrix4d &transform, const double inlier_threshold) {
+    Eigen::MatrixX3d pj_est =  point_i * transform.block<3,3>(0,0).transpose();
+    pj_est = pj_est.rowwise() + transform.block<3,1>(0,3).transpose();
+
+    const Eigen::MatrixX3d residuals = pj_est - point_j;
+
+    std::vector<Eigen::Index> inlier_indicies;
+
+    for (Eigen::Index i = 0; i < point_j.rows(); ++i) {
+      if (residuals.row(i).norm() < inlier_threshold) {
+        inlier_indicies.push_back(i);
+      }
+    }
+    return inlier_indicies;
+  }
+
+
+  Consensus ransac_generic(
+    const Eigen::Index num_points,
+    const int min_sample_size,
+    const ScoreFitFn &score_fit,
+    const double desired_confidence,
+    const int max_iterations
+  ) {
+    int num_iterations = max_iterations;
+    int iterations_done = 0;
+
+    std::vector<Eigen::Index> best_inliers;
+    double best_w = 0.0;
+
+    while (iterations_done < num_iterations) {
+      auto candidate = score_fit(random_points(num_points, min_sample_size));
+      // a degenerate sample still consumed an iteration
+      iterations_done++;
+      if (!candidate.has_value()) continue;
+
+      auto &inliers = *candidate;
+      if (!inliers.empty() && inliers.size() > best_inliers.size()) {
+        best_w = static_cast<double>(inliers.size()) / static_cast<double>(num_points);
+        // N = log(1-p) / log(1-w^s). Both logs are negative, so the quotient is
+        // positive; min() because evidence may only ever SHRINK the budget.
+        const auto candidate_iterations = static_cast<int>(
+            std::log(1.0 - desired_confidence)
+            / std::log(1.0 - std::pow(best_w, min_sample_size)));
+        num_iterations = std::min(num_iterations, candidate_iterations);
+        best_inliers = std::move(inliers);   // last use of `inliers`
+      }
+    }
+
+    return {.inliers = best_inliers, .inlier_ratio = best_w};
+  }
+
+  RansacFit kabsch_ransac(
+    const Eigen::MatrixX3d &point_i,
+    const Eigen::MatrixX3d &point_j,
+    const double inlier_threshold,
+    const double degeneracy_threshold
+  ) {
+    assert(point_i.rows() == point_j.rows());
+
+    // idx -> pose. KabschFit unwraps here: degeneracy is consumed, not propagated.
+    const auto fit = [&](const std::vector<Eigen::Index> &idx)
+        -> std::optional<Eigen::Matrix4d> {
+      // fewer than 3 points makes the centroids and thus degeneracy NaN, and
+      // NaN < threshold is FALSE -- the guard below would pass a garbage pose.
+      if (idx.size() < 3) return std::nullopt;
+      const KabschFit kab = kabsch_algorithm(point_i(idx, Eigen::placeholders::all),
+                                             point_j(idx, Eigen::placeholders::all));
+      if (kab.degeneracy < degeneracy_threshold) return std::nullopt;
+      return kab.T_ji;
+    };
+
+    // pose -> who agrees with it
+    const auto score = [&](const Eigen::Matrix4d &T) {
+      return inlier_indices(point_i, point_j, T, inlier_threshold);
+    };
+
+    const auto score_fit = [&](const std::vector<Eigen::Index> &idx)
+        -> std::optional<std::vector<Eigen::Index>> {
+      if (const auto T = fit(idx)) return score(*T);
+      return std::nullopt;
+    };
+
+    const Consensus consensus = ransac_generic(point_i.rows(), 3, score_fit);
+
+    // the minimal-sample fits were only search probes -- 3 points, no averaging.
+    // This refit over the whole consensus set is where the accuracy comes from.
+    const auto T = fit(consensus.inliers);
+    if (!T) return {.T_ji = Eigen::Matrix4d::Identity(), .inliers = {}, .inlier_ratio = 0.0};
+
+    const auto inliers = score(*T);
+    return {.T_ji = *T,
+            .inliers = inliers,
+            .inlier_ratio = static_cast<double>(inliers.size())
+                            / static_cast<double>(point_i.rows())};
+  }
+
 }
