@@ -1,4 +1,7 @@
 #include "pose_se3.hpp"
+
+#include <Eigen/Geometry>
+
 #include "utils.hpp"
 
 namespace geometry {
@@ -7,6 +10,13 @@ namespace geometry {
     const Eigen::Vector3d t = M.block<3,1>(0,3);
     R_ = RotationSO3(R);
     t_ = t;
+  }
+
+  PoseSE3::PoseSE3(const double x, const double y, const double z, const double q_x, const double q_y, const double q_z, const double q_w) {
+    const auto q = Eigen::Quaterniond(q_w, q_x, q_y, q_z);
+    R_ = RotationSO3(q.toRotationMatrix());
+    t_ = Eigen::Vector3d(x, y, z);
+
   }
 
   Eigen::Matrix4d PoseSE3::matrix() const {

@@ -34,9 +34,10 @@ dev = [
 [tool.scikit-build]
 # Package lives under python/, not the repo root, so this must be explicit.
 wheel.packages = ["python/visual_pose"]
-# Debug so the .so carries symbols and CLion can break inside C++ called from
-# Python. Override at deploy time with SKBUILD_CMAKE_BUILD_TYPE=Release.
-cmake.build-type = "Debug"
+# RelWithDebInfo, not Debug: still carries symbols so CLion can break inside C++
+# called from Python, but Debug means -O0, and Eigen is templated expression code
+# that lives or dies on inlining.
+cmake.build-type = "RelWithDebInfo"
 build-dir = "build/{wheel_tag}"
 
 [tool.scikit-build.editable]

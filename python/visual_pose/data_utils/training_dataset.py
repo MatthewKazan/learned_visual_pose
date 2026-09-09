@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from torch import Tensor
 from torch.utils.data import Dataset
 
 from torchvision.transforms import ColorJitter
@@ -50,10 +51,17 @@ class TACorrespondenceDataset(Dataset):
         gaps = [frame_gap] if isinstance(frame_gap, int) else frame_gap
         self.pairs = [(i, i + g) for g in gaps for i in range(len(sequence) - g)]
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.pairs)
 
-    def __getitem__(self, index, _tries: int = 0):
+    def __getitem__(self, index: int, _tries: int = 0) -> dict[str, Tensor]:
+        """
+        rgb_i, rgb_j  (3, H, W) float in [0, 1]
+        uv_i, uv_j    (num_correspondences, 2) image pixels, (u, v), float
+
+        The correspondence count is FIXED so batches collate; the padding
+        branch below is what guarantees it.
+        """
         if len(self.pairs) <= index:
             raise IndexError(f"index {index} out of range for dataset of length {len(self)}")
 
@@ -104,16 +112,12 @@ class TACorrespondenceDataset(Dataset):
             uv_i = uv_i[rand]
             uv_j = uv_j[rand]
         elif _tries < 6:
-            # Non-viable pairs cluster along a trajectory -- consecutive frames
-            # are all sky, or all shadow -- so index+1 usually fails too and the
-            # chain redoes two depth loads, two PNGs and the full geometry each
-            # step. Measured 1296ms vs a 74ms median on P002. Jump a long way
-            # instead, and cap the attempts.
+            # Bad pairs cluster, so index+1 usually fails too: 1296ms against
+            # a 74ms median on P002. Jump far and cap the attempts.
             return self.__getitem__((index + 397) % len(self), _tries + 1)
         else:
-            # Give up jumping and pad by resampling. Duplicates are bad for
-            # InfoNCE (a duplicate row is a false negative at cosine 1.0) but
-            # far better than an unbounded retry storm.
+            # Pad by resampling. A duplicate row is a false negative at
+            # cosine 1.0, but better than an unbounded retry.
             pad = torch.randint(0, len(uv_i), (self.num_correspondences,))
             uv_i, uv_j = uv_i[pad], uv_j[pad]
 

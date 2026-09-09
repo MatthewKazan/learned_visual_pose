@@ -1,6 +1,8 @@
-from torch import nn
+from torch import nn, Tensor
 from torch.nn import functional as F
 from typing import List
+
+from visual_pose.config import Config
 
 
 class DescriptorCNN(nn.Module):
@@ -16,15 +18,9 @@ class DescriptorCNN(nn.Module):
         super().__init__()
 
         n = len(body_channels)
-        # Dilation spreads a kernel's taps apart instead of adding taps, so the
-        # span grows to (k-1)*d + 1 for the same weights and FLOPs. Receptive
-        # field is the one axis that has moved the metric (RF 15 -> 57 was
-        # +40pp), and bigger kernels pay for it quadratically: kernel 9 reaches
-        # RF 57 for 3.4M params where dilation (1,3,9) reaches RF 87 for 0.4M.
-        #
-        # It also isolates the variable. Depth or width would grow reach AND
-        # capacity together; dilation holds parameters, FLOPs and layer count
-        # fixed, so a change in the metric can only be reach.
+        # Dilation spreads the taps instead of adding them, so the span is
+        # (k-1)*d + 1 at fixed parameters. RF 15 -> 57 was +40pp, and kernels
+        # pay for reach quadratically where dilation pays nothing.
         body_dilations = [1] * n if body_dilations is None else list(body_dilations)
 
         assert len(body_kernel_sizes) == n, "body_channels and body_kernel_sizes must match"
@@ -50,10 +46,8 @@ class DescriptorCNN(nn.Module):
     @staticmethod
     def _conv_block(in_ch: int, out_ch: int, kernel_size: int, stride: int,
                     dilation: int = 1, norm: str = "batch") -> nn.Sequential:
-        # BatchNorm normalizes using statistics across the batch. With shuffled
-        # multi-environment batches one batch can hold a bright hospital and a
-        # near-black night factory, so those statistics blend unrelated scenes.
-        # GroupNorm is per-sample and immune to that.
+        # BatchNorm blends statistics across a shuffled multi-environment
+        # batch; GroupNorm is per-sample and immune.
         if norm == "batch":
             norm_layer = nn.BatchNorm2d(out_ch)
         elif norm == "group":
@@ -63,11 +57,9 @@ class DescriptorCNN(nn.Module):
         else:
             raise ValueError(f"unknown norm {norm!r}, expected batch|group|none")
 
-        # 'same' padding is half the EFFECTIVE kernel, so dilation scales it:
-        # (k_eff - 1)/2 = dilation * (k-1)/2. Leaving it at k//2 shrinks the map
-        # by 2*(d-1) per layer, which does not raise -- it silently changes the
-        # descriptors.shape/images.shape ratio that every coordinate conversion
-        # is derived from, and reads as "the descriptor got worse".
+        # 'same' padding is half the EFFECTIVE kernel: dilation * (k-1)/2.
+        # k//2 shrinks the map silently, which breaks every coordinate
+        # conversion and reads as "the descriptor got worse".
         return nn.Sequential(
             nn.Conv2d(in_ch, out_ch, kernel_size, stride,
                       padding=dilation * (kernel_size - 1) // 2, dilation=dilation),
@@ -76,7 +68,7 @@ class DescriptorCNN(nn.Module):
         )
 
     @classmethod
-    def from_config(cls, cfg):
+    def from_config(cls, cfg: Config) -> "DescriptorCNN":
         return cls(
             body_channels=cfg.body_channels,
             body_kernel_sizes=cfg.body_kernel_sizes,
@@ -86,7 +78,7 @@ class DescriptorCNN(nn.Module):
             norm=cfg.norm,
         )
 
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         """
         x: (B, 3, H, W) RGB image, values in [0, 1]
         returns: (B, descriptor_dim, H', W') L2-normalized descriptors,

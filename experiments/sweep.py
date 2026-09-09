@@ -142,7 +142,7 @@ SKIPPED = {
 #
 # Kernel 9 costs 3.4M params against 0.4M at baseline -- quadratic in k. Dilation
 # reaches the same distances at kernel-3 cost and is the better lever, deferred
-# to VIS-018b until it is understood rather than added blind.
+# until it is understood rather than added blind.
 # ---------------------------------------------------------------------------
 STAGE2_PROXY = dict(
     train_sequences=("P000", "P006"),

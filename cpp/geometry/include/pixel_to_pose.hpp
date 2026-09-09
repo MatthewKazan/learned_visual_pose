@@ -4,6 +4,8 @@
 #include <optional>
 #include <vector>
 
+#include "pose_se3.hpp"
+
 namespace geometry::camera {
 
   /**
@@ -18,7 +20,7 @@ namespace geometry::camera {
   Eigen::Matrix3d eight_point_algorithm(const Eigen::MatrixX3d &ray_i, const Eigen::MatrixX3d &ray_j);
 
   struct KabschFit {
-    Eigen::Matrix4d T_ji;
+    PoseSE3 T_ji;
     /// sigma2/sigma1. Near zero means collinear input: rotation about that line
     /// is undetermined and T_ji is arbitrary. Coplanar input is NOT flagged --
     /// it is a valid case here, unlike for the essential matrix.
@@ -34,7 +36,7 @@ namespace geometry::camera {
   };
 
   struct RansacFit {
-    Eigen::Matrix4d T_ji;
+    PoseSE3 T_ji;
     /// Indices into the input clouds, from the post-refit classification.
     /// Empty (and inlier_ratio 0) means no usable consensus was found.
     std::vector<Eigen::Index> inliers;
@@ -66,13 +68,13 @@ namespace geometry::camera {
    * @param point_i point cloud i (Nx3)
    * @param point_j point cloud j (Nx3)
    *
-   * @return 4x4 Transformation matrix aligning the point clouds and σ2/σ1 ratio
+   * @return T_ji aligning the point clouds, and the σ2/σ1 ratio
    */
   KabschFit kabsch_algorithm(const Eigen::MatrixX3d &point_i, const Eigen::MatrixX3d &point_j);
 
   std::vector<Eigen::Index> inlier_indices(const Eigen::MatrixX3d &point_i,
                                            const Eigen::MatrixX3d &point_j,
-                                           const Eigen::Matrix4d &transform,
+                                           const PoseSE3 &transform,
                                            double inlier_threshold);
 
   /**
@@ -100,6 +102,32 @@ namespace geometry::camera {
                           const Eigen::MatrixX3d &point_j,
                           double inlier_threshold = 0.05,
                           double degeneracy_threshold = 1e-3);
+
+
+  /**
+   * Sample pointcloud evenly by getting furthest point from the current set of sampled points iteratively.
+   *
+   * @param points Points in the original pointcloud
+   * @param num_points_to_sample Size of sampled points ot return
+   *
+   * @return num_points_to_sample points from original pointcloud.
+   */
+  /**
+   * Greedy farthest-point sampling: repeatedly take the point furthest from
+   * everything picked so far. Maximises spatial spread, which is what
+   * conditions a rigid fit -- clustered points approach the collinear
+   * degeneracy without the inlier count ever showing it.
+   *
+   * Returns INDICES, not points: these clouds are correspondences, so the
+   * caller must index BOTH sides with the same selection or the pairing is
+   * destroyed. Sampling each cloud independently is silently wrong.
+   *
+   * Asking for at least as many points as exist returns every index in order,
+   * so K = "all" is a valid sweep endpoint rather than an error.
+   */
+  std::vector<Eigen::Index> farthest_point_sample(const Eigen::MatrixX3d &points,
+                                                  Eigen::Index num_points_to_sample);
+
 
 
 }

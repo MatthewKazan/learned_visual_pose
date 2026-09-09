@@ -4,6 +4,14 @@ project(learned_visual_pose LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+
+# An empty CMAKE_BUILD_TYPE means NO -O flag
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+    message(STATUS "CMAKE_BUILD_TYPE was empty; defaulting to Release")
+endif()
 
 include(FetchContent)
 
@@ -96,8 +104,27 @@ target_link_libraries(
       Eigen3::Eigen
 )
 
+add_library(
+    pose_graph
+    cpp/pose_graph/include/graph_struct.hpp
+    cpp/pose_graph/src/graph_struct.cpp
+    cpp/pose_graph/include/pose_graph.hpp
+)
+
+target_include_directories(
+    pose_graph
+    PUBLIC
+    cpp/pose_graph/include
+)
+
+target_link_libraries(
+    pose_graph
+    PUBLIC
+    geometry
+)
+
 pybind11_add_module(_geometry cpp/bindings/geometry_py.cpp)
-target_link_libraries(_geometry PRIVATE geometry)
+target_link_libraries(_geometry PRIVATE geometry pose_graph)
 install(TARGETS _geometry DESTINATION visual_pose)
 
 # SKBUILD is set only when scikit-build-core is driving the build for a wheel.
@@ -131,6 +158,7 @@ if(NOT SKBUILD)
         cpp/tests/test_pose_se3.cpp
         cpp/tests/test_pinhole_camera.cpp
         cpp/tests/test_pixel_to_pose.cpp
+        cpp/tests/test_graph_struct.cpp
     )
 
     target_link_libraries(
@@ -138,6 +166,7 @@ if(NOT SKBUILD)
         PRIVATE
           GTest::gtest_main
           geometry
+          pose_graph
     )
 
     include(GoogleTest)

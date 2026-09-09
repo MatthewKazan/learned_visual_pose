@@ -6,20 +6,11 @@ from torch.nn import functional as F
 
 
 class SIFT(nn.Module):
-    """
-    OpenCV SIFT dressed up as a DescriptorCNN, so test_model / visualize_matches
-    can consume it unchanged: (B,3,H,W) float in [0,1] -> (B,128,H',W') unit
-    descriptors on a step-sized grid.
+    """OpenCV SIFT as an nn.Module, on the same grid as the CNN.
 
-    Descriptors are computed at supplied keypoints rather than SIFT's own
-    detections. That is deliberate: letting SIFT choose would give it ~200 easy,
-    distinctive points instead of the same 4800 the CNN answers at, and the
-    comparison would measure keypoint selection rather than descriptor quality.
-
-    Both methods then get identical treatment downstream -- same bilinear
-    interpolation at uv_i, same candidate grid, same quantization ceiling.
-    Interpolating SIFT histograms is a little odd in principle, but equal
-    treatment matters more than individually principled treatment here.
+    Descriptors are computed at fixed grid keypoints rather than detected ones,
+    so the comparison holds the sampling constant and varies only the
+    descriptor. Output (B, 128, H', W'), L2-normalised over the channel.
     """
 
     # SIFT's patch diameter. Unlike its own detections (which set size from

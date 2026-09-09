@@ -6,6 +6,7 @@ namespace geometry::camera {
   class PinholeCamera {
   public:
     PinholeCamera(const double fx, const double fy, const double cx, const double cy) : fx_(fx), fy_(fy), cx_(cx), cy_(cy) {}
+    explicit PinholeCamera(const Eigen::Matrix3d& K) : fx_(K(0,0)), fy_(K(1,1)), cx_(K(0,2)), cy_(K(1,2)) {}
 
     Eigen::Matrix3d matrix() const;
     Eigen::Vector2d project(const Eigen::Vector3d& point) const;

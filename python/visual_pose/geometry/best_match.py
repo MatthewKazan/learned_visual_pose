@@ -1,33 +1,31 @@
 import torch
-from torch import arange
+from torch import Tensor, arange, nn
 
-from visual_pose.data_utils.constants import SIMILARITY_THRESHOLD
-
-# a real peak curves downward; anything flatter than this is not something a
-# parabola can localize, so refinement backs off rather than dividing by ~0
+# flatter than this and the parabola fit divides by ~0, so refinement backs off
 _MIN_CURVATURE = 1e-6
 
 
-def unflatten_cells(flat_indices, W_feat):
+def unflatten_cells(flat_indices: Tensor, W_feat: int) -> tuple[Tensor, Tensor]:
     """
-    Flat candidate index -> (u', v') feature-grid coordinates.
+    Flat candidate index -> (u', v') feature cells.
 
-    Assumes the row-major collapse with W' on the fast axis, i.e. this is the
-    inverse of permute(0,2,3,1).flatten(1,2). Kept separate from the pixel
-    conversion so subpixel refinement can add a fractional offset in between.
+    Inverse of permute(0,2,3,1).flatten(1,2), so W' is the fast axis. Separate
+    from the pixel conversion so refinement can add a fraction in between.
     """
     return flat_indices % W_feat, flat_indices // W_feat
 
 
-def cells_to_pixels(u_prime, v_prime, feature_space_shape, image_shape):
+def cells_to_pixels(u_prime: Tensor, v_prime: Tensor,
+                    feature_space_shape: tuple[int, int],
+                    image_shape: tuple[int, int]) -> Tensor:
     """
-    (u', v') feature cells -> (..., 2) image pixels, as (u, v).
+    (u', v') feature cells -> (..., 2) image pixels. Floats allowed.
 
-    Takes floats: cell k spans stride pixels and its CENTRE is what the
-    descriptor describes, which is the align_corners=False convention --
-    (k + 0.5) * stride - 0.5. descriptors_at applies the matching forward
-    transform; changing one without the other introduces a half-cell bias that
-    cancels inside MMA but not inside an essential matrix.
+        pixel = (cell + 0.5) * stride - 0.5
+
+    The descriptor describes the cell CENTRE, hence the half-cell terms.
+    descriptors_at does the forward version; change one without the other and
+    you get a half-cell bias that MMA hides but a pose estimate does not.
     """
     assert len(feature_space_shape) == 2, "feature_space_shape must be (H, W)"
     assert len(image_shape) == 2, "image_shape must be (H, W)"
@@ -37,21 +35,22 @@ def cells_to_pixels(u_prime, v_prime, feature_space_shape, image_shape):
     return torch.stack([u_pixel, v_pixel], dim=-1)
 
 
-def gridify_uvs(flat_indices, feature_space_shape, image_shape):
+def gridify_uvs(flat_indices: Tensor, feature_space_shape: tuple[int, int],
+                image_shape: tuple[int, int]) -> Tensor:
     """Flat index -> image pixels, no refinement. (...) -> (..., 2)"""
     u_prime, v_prime = unflatten_cells(flat_indices, feature_space_shape[1])
     return cells_to_pixels(u_prime, v_prime, feature_space_shape, image_shape)
 
 
-def _parabola_offset(s_minus, s_zero, s_plus, in_bounds):
+def _parabola_offset(s_minus: Tensor, s_zero: Tensor, s_plus: Tensor,
+                     in_bounds: Tensor) -> Tensor:
     """
-    Sub-cell peak position from three samples, s_zero being the argmax.
+    Sub-cell peak from three samples, s_zero being the argmax.
 
         delta = 0.5 * (s- - s+) / (s- - 2*s0 + s+)
 
-    Fitting a parabola through the three and solving for its vertex. Returns 0
-    where the peak sits on a border (no neighbour) or the surface is too flat to
-    localize, so those matches keep their integer cell rather than a wild guess.
+    A parabola through the three, solved for its vertex. Returns 0 on a border
+    (no neighbour) or a too-flat peak, so those keep their integer cell.
     """
     curvature = s_minus - 2 * s_zero + s_plus
     usable = in_bounds & (curvature < -_MIN_CURVATURE)
@@ -62,17 +61,19 @@ def _parabola_offset(s_minus, s_zero, s_plus, in_bounds):
     return delta.clamp(-0.5, 0.5)
 
 
-def subpixel_offsets(similarity, flat_indices, peak_values, feature_space_shape):
+def subpixel_offsets(similarity: Tensor, flat_indices: Tensor, peak_values: Tensor,
+                     feature_space_shape: tuple[int, int]) -> tuple[Tensor, Tensor]:
     """
-    (du, dv) sub-cell corrections for each argmax, both in [-0.5, 0.5] cells.
+    (du, dv) sub-cell corrections per argmax, each in [-0.5, 0.5] cells.
 
-    argmax alone quantizes every match to the stride -- 8 px here -- and that
-    quantization is correlated across matches (everything lands on the same
-    lattice), so it biases a pose fit rather than averaging out. Measured cost
-    with otherwise-perfect correspondences: ~5.9 deg of translation direction.
+    similarity (B, N, M), flat_indices and peak_values (B, N) -> (B, N) each.
 
-    The four neighbours are a fixed offset away in the flat layout, so this
-    needs gathers rather than reshaping the (B, N, M) similarity matrix.
+    Without this every match lands on the stride lattice, and that error is the
+    same for all of them, so it biases a pose fit instead of averaging out --
+    ~5.9 deg of translation direction on otherwise-perfect correspondences.
+
+    Neighbours are a fixed offset in the flat layout, hence gathers rather than
+    reshaping the (B, N, M) matrix.
     """
     H_feat, W_feat = feature_space_shape
     n_candidates = H_feat * W_feat
@@ -96,38 +97,32 @@ def best_match(
         image_shape: tuple[int, int],
         query_descriptors_i: torch.Tensor,
         subpixel: bool = True,
-):
+) -> tuple[Tensor, Tensor, Tensor]:
     """
-    Take a grid of descriptors for each image, and find the best matches.
+    Nearest neighbour in image j for each query descriptor from image i.
 
-    :param query_descriptors_i: (B, N, D) L2-normalized query descriptors for image i --
-                          DescriptorCNN.forward output flattened from (B, D, H, W)
-    :param descriptors_j: (B, D, H', W') L2-normalized descriptors for image j
-    :param image_shape:   (H, W) of the original image. H / H' is the total
-                          stride, needed to map feature cells back to pixels
-    :param subpixel:      refine each argmax against its neighbours. Off gives
-                          the raw lattice, which is what MMA@8 was measured on.
+    :param query_descriptors_i: (B, N, D) unit-length queries
+    :param descriptors_j:       (B, D, H', W') unit-length map to search
+    :param image_shape:         (H, W); H/H' is the stride
+    :param subpixel:            refine each argmax against its neighbours
 
-    :return: (uv_j, score, mutual)
-             uv_j   (B, N, 2) float, best match per query in image j pixel coords
-             score  (B, N)    the winning cosine -- the rejection threshold reads this
-             mutual (B, N)    bool, True where the match points back at its query
+    :return: uv_j   (B, N, 2) match position in image j pixels
+             score  (B, N) winning cosine, what the threshold reads
+             mutual (B, N) True where the match points back at its query
     """
     assert len(image_shape) == 2, "image_shape must be (H, W)"
     feature_space_shape = tuple(descriptors_j.shape[2:])
 
-    # the answer pool: image j's whole map as a flat list of candidates.
-    # (B,D,H',W') -> (B,H',W',D) -> (B, M, D) with M = H'*W'.
-    # Row-major collapse puts W' on the fast axis, hence the div/mod below.
+    # image j's whole map as M = H'*W' candidates. Row-major, so W' is the
+    # fast axis -- which is what unflatten_cells assumes.
     candidate_j = descriptors_j.permute(0, 2, 3, 1).flatten(1, 2)
 
-    # (B,N,D) @ (B,D,M) -> (B, N, M). Descriptors are unit length, so the
-    # dot product IS the cosine. argmax over M -> (B, N) winning indices.
+    # unit length, so the dot product is the cosine. (B, N, M)
     similarity = torch.matmul(query_descriptors_i, candidate_j.transpose(-1, -2))
     best = similarity.max(dim=-1)  # best.values (B,N), best.indices (B,N)
 
-    # injectivity: the raw argmax will happily map many queries onto one cell.
-    # "who does my match point back at -- me?"
+    # raw argmax maps many queries onto one cell, so ask each winner who its
+    # own best query is
     nn_ji = similarity.argmax(dim=1)  # (B, M) each candidate's best query
     queries = arange(query_descriptors_i.shape[1], device=similarity.device)
     mutual = nn_ji.gather(1, best.indices) == queries  # (B, N) bool
@@ -141,35 +136,46 @@ def best_match(
     return uv_j, best.values, mutual
 
 
-def get_matching_pairs(model, images_i, images_j):
+def get_matching_pairs(model: nn.Module, images_i: Tensor,
+                       images_j: Tensor, similarity_threshold: float) -> tuple[Tensor, Tensor]:
+    """
+    Mutual, above-threshold correspondences for one pair. (B, 3, H, W) each
+    -> (uv_i, uv_j), (K, 2) image pixels each. K varies with the pair.
+    """
     assert images_i.shape == images_j.shape, "images_i and images_j must have the same shape"
-    # boolean masking below flattens the batch, so B>1 would silently merge
-    # correspondences from different image pairs into one list -- and a single
-    # essential matrix fitted across two camera motions is meaningless.
+    # the mask below flattens the batch, so B>1 would merge correspondences
+    # from different pairs into one list
     assert images_i.shape[0] == 1, "only batch size 1 is supported"
 
     descriptors_i = model(images_i)
     descriptors_j = model(images_j)
+    return get_matching_pairs_from_descriptors(
+        descriptors_i, descriptors_j, tuple(images_i.shape[2:]), similarity_threshold)
 
+
+
+def get_matching_pairs_from_descriptors(descriptors_i, descriptors_j, image_shape,
+                                        similarity_threshold):
+    """Same as get_matching_pairs but on already-encoded descriptor maps."""
     uv_i = gridify_uvs(
         flat_indices=arange(descriptors_i.shape[2] * descriptors_i.shape[3],
                             device=descriptors_i.device),
         feature_space_shape=descriptors_i.shape[2:],
-        image_shape=images_i.shape[2:]
+        image_shape=image_shape
     )
     # every batch element queries the same grid, so this is a stride-0 view
-    uv_i = uv_i.expand(len(images_i), -1, -1)
+    uv_i = uv_i.expand(1, -1, -1)
 
     query_descriptors = descriptors_i.permute(0, 2, 3, 1).flatten(1, 2)
 
     best_uv_js, scores, mutual = best_match(
         query_descriptors_i=query_descriptors,
         descriptors_j=descriptors_j,
-        image_shape=(images_j.shape[2], images_j.shape[3])
+        image_shape=image_shape
     )
-    # check alignment BEFORE masking -- afterwards both sides carry the same
-    # mask and the comparison is a tautology
+    # before masking: afterwards both sides carry the same mask and this is
+    # a tautology
     assert best_uv_js.shape == uv_i.shape, "mismatch in shape between query descriptors and best matches"
 
-    mask = mutual & (scores > SIMILARITY_THRESHOLD)
+    mask = mutual & (scores > similarity_threshold)
     return uv_i[mask], best_uv_js[mask]

@@ -6,7 +6,7 @@ Run: python -m experiments.check_bilinear
 import torch
 from torch.nn import functional as F
 
-from visual_pose.matching import bilinear_sample
+from visual_pose.matching import bilinear_sample_descriptor
 
 
 def reference(descriptor, feature_uvs):
@@ -34,7 +34,7 @@ if __name__ == "__main__":
     expected = reference(descriptor, feature_uvs)
     print(f"expected shape: {tuple(expected.shape)}")
 
-    actual = bilinear_sample(descriptor, feature_uvs)
+    actual = bilinear_sample_descriptor(descriptor, feature_uvs)
     print(f"actual   shape: {tuple(actual.shape)}")
 
     print(f"\nexpected[0,0]: {expected[0, 0]}")

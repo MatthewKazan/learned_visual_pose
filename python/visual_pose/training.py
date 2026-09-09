@@ -4,28 +4,30 @@ The contrastive objective and the epoch loop.
 Top of the stack: imports matching (for descriptors_at and the val metric) and
 checkpoints (for saving). Nothing imports this except the entry point and sweeps.
 """
+from collections.abc import Callable
 from functools import partial
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from torch import nn, Tensor
+from torch.optim import Optimizer
+from torch.optim.lr_scheduler import LRScheduler
+from torch.utils.data import DataLoader
 
 from visual_pose.checkpoints import save_checkpoint
 from visual_pose.data_utils.constants import DEVICE, REPO_DIR
 from visual_pose.data_utils.loaders import on_device
 from visual_pose.matching import descriptors_at, mma, test_model
 
-def infoNCE_loss(sampled_i, sampled_j, temperature=0.07):
-    """
-    InfoNCE over matched descriptor pairs, (B, N, D) each, where row n of both
-    is the same 3D point from two views.
+def infoNCE_loss(sampled_i: Tensor, sampled_j: Tensor,
+                 temperature: float = 0.07) -> Tensor:
+    """InfoNCE over matched pairs, (B, N, D) each, row n the same 3D point.
 
         L_n = -log[ exp(S[n,n]/t) / sum_k exp(S[n,k]/t) ]
 
-    That fraction is a softmax over row n, and -log of the target's entry is
-    cross_entropy -- so cross_entropy(S/t, labels) IS the formula above, with
-    log-sum-exp stabilization for free.
-
-    Sanity: loss ~= log(N) (6.24 at N=512) untrained, ~0 when perfect.
+    That fraction is a softmax over row n, so cross_entropy(S/t, labels) is the
+    same thing with log-sum-exp stabilisation. Untrained loss ~= log(N).
     """
     B, N, _ = sampled_i.shape
 
@@ -49,26 +51,21 @@ def infoNCE_loss(sampled_i, sampled_j, temperature=0.07):
     return 0.5 * (loss_i_to_j + loss_j_to_i)
 
 
-def train_val_model(model, train_data_loader, val_data_loader, loss_fn, optimizer,
-                    lr_scheduler, num_epochs, print_freq=50, temperature=0.07,
-                    checkpoint_dir=REPO_DIR / "checkpoints", checkpoint_tau=8,
-                    on_epoch_end=None, eval_every=1):
-    """
-    Training and validating a CNN model using PyTorch.
+def train_val_model(model: nn.Module, train_data_loader: DataLoader,
+                    val_data_loader: DataLoader, loss_fn: Callable,
+                    optimizer: Optimizer, lr_scheduler: LRScheduler,
+                    num_epochs: int, print_freq: int = 50,
+                    temperature: float = 0.07,
+                    checkpoint_dir: Path = REPO_DIR / "checkpoints",
+                    checkpoint_tau: float = 8,
+                    on_epoch_end: Callable[[int, float], None] | None = None,
+                    eval_every: int = 1) -> nn.Module:
+    """Train, evaluating on val every `eval_every` epochs. Returns the model.
 
-    Inputs:
-      - model: A CNN implemented in PyTorch
-      - data_loader: A data loader that will provide batched images and labels
-      - loss_fn: A loss function (e.g., cross entropy loss)
-      - lr_scheduler: Learning rate scheduler
-      - num_epochs: Number of epochs in total
-      - print_freq: Frequency to print training statistics
-      - checkpoint_dir: where last.pt / best.pt go
-      - checkpoint_tau: the MMA threshold "best" is judged on
-
-    Output:
-      - model: Trained CNN model
-    """
+        last.pt every epoch so a crash costs one epoch; best.pt only on
+        improvement, so it survives later overfitting. on_epoch_end lets a
+        sweep report progress or abandon a trial by raising.
+        """
     model.to(DEVICE)
     best_mma = -1.0
 
@@ -131,20 +128,15 @@ def train_val_model(model, train_data_loader, val_data_loader, loss_fn, optimize
     return model
 
 
-def set_up_loss_optimizer_lr_scheduler(model, learning_rate, momentum, num_epochs,
-                                       weight_decay=1e-4, min_lr_factor=0.01,
-                                       optimizer="sgd", temperature=0.07):
-    """
-    Optimizer + cosine-annealed learning rate + the loss, ready to hand to
-    train_val_model.
+def set_up_loss_optimizer_lr_scheduler(
+        model: nn.Module, learning_rate: float, momentum: float, num_epochs: int,
+        weight_decay: float = 1e-4, min_lr_factor: float = 0.01,
+        optimizer: str = "sgd", temperature: float = 0.07,
+) -> tuple[Callable, Optimizer, LRScheduler]:
+    """Optimizer, cosine-annealed schedule, and the loss.
 
-    Cosine rather than StepLR because StepLR's total decay is step_size and gamma
-    multiplied out, which desyncs from num_epochs silently -- step_size=n/3 with
-    gamma=0.1 always lands at lr/1000 and spends the last third of the run frozen.
-    Cosine takes T_max=num_epochs and decays smoothly to eta_min, so the schedule
-    always spans exactly the run.
-
-    weight_decay is plain L2 regularization, aimed at the train/val gap.
+    Cosine rather than StepLR: StepLR's total decay is step_size times gamma,
+    which desyncs from num_epochs and froze the last third of a run at lr/1000.
     """
     if optimizer == "sgd":
         opt = torch.optim.SGD(model.parameters(), lr=learning_rate,

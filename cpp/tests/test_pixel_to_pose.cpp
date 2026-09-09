@@ -5,6 +5,10 @@
 #include <geometry.hpp>
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <numeric>
+#include <set>
+#include <stdexcept>
 
 #include "pixel_to_pose.hpp"
 
@@ -258,7 +262,7 @@ TEST(TestPixelToPose, SwappingImagesTransposesE) {
 }
 
 // E * e == 0 where e is the direction from camera i toward camera j, because
-// E = hat(t) * R and hat(t) * t == 0. This is where VIS-012 gets the epipole.
+// E = hat(t) * R and hat(t) * t == 0. This is where we get the epipole.
 TEST(TestPixelToPose, EpipoleIsTheNullVector) {
   const Eigen::Matrix3d E = eight_point_algorithm(uv_i_general, uv_j_general);
   EXPECT_NEAR((E * epipole_i_general).norm(), 0.0, 1e-9);
@@ -489,7 +493,7 @@ namespace {
 // machine precision, not "close". The eight-point algorithm has no equivalent
 // assertion because E is only defined up to scale and sign.
 TEST(TestKabsch, RecoversKnownTransformExactly) {
-  const Eigen::Matrix4d T = kabsch_algorithm(kabsch_i_general, kabsch_j_general).T_ji;
+  const Eigen::Matrix4d T = kabsch_algorithm(kabsch_i_general, kabsch_j_general).T_ji.matrix();
 
   EXPECT_LT((rotation_of(T) - R_kabsch).norm(), 1e-12);
   EXPECT_LT((translation_of(T) - t_kabsch).norm(), 1e-12);
@@ -498,14 +502,15 @@ TEST(TestKabsch, RecoversKnownTransformExactly) {
 // Every point, not just the fit's own cost. Row 0 is the origin of the cloud,
 // where a translation-only bug is invisible.
 TEST(TestKabsch, MapsEveryPointExactly) {
-  const Eigen::Matrix4d T = kabsch_algorithm(kabsch_i_general, kabsch_j_general).T_ji;
+  const Eigen::Matrix4d T = kabsch_algorithm(kabsch_i_general, kabsch_j_general).T_ji.matrix();
   EXPECT_NEAR(worst_point_error(T, kabsch_i_general, kabsch_j_general), 0.0, 1e-12);
 }
 
-// A Matrix4d has room to be malformed. The bottom row is not decoration: chain
-// two transforms with a wrong one and the error is silent and cumulative.
+// R orthonormal with det +1 is Kabsch's job. The bottom row is no longer --
+// T_ji is a PoseSE3, which stores R and t separately and cannot represent a
+// malformed transform, so that assertion now covers PoseSE3::matrix() instead.
 TEST(TestKabsch, ReturnsAWellFormedRigidTransform) {
-  const Eigen::Matrix4d T = kabsch_algorithm(kabsch_i_noisy, kabsch_j_noisy).T_ji;
+  const Eigen::Matrix4d T = kabsch_algorithm(kabsch_i_noisy, kabsch_j_noisy).T_ji.matrix();
   const Eigen::Matrix3d R = rotation_of(T);
 
   EXPECT_LT((R.transpose() * R - Eigen::Matrix3d::Identity()).norm(), 1e-12);
@@ -517,7 +522,7 @@ TEST(TestKabsch, ReturnsAWellFormedRigidTransform) {
 // so residual and orthonormality both pass on the reflection. A missing
 // diag(1, 1, sign(det)) correction fails here and nowhere else in this file.
 TEST(TestKabsch, RejectsReflections) {
-  const Eigen::Matrix4d T = kabsch_algorithm(kabsch_i_reflect, kabsch_j_reflect).T_ji;
+  const Eigen::Matrix4d T = kabsch_algorithm(kabsch_i_reflect, kabsch_j_reflect).T_ji.matrix();
 
   EXPECT_NEAR(rotation_of(T).determinant(), 1.0, 1e-12) << "returned a reflection";
   EXPECT_LT((rotation_of(T) - R_reflect_expected).norm(), 1e-12);
@@ -529,7 +534,7 @@ TEST(TestKabsch, RejectsReflections) {
 // same reflection ambiguity as K-D, resolved the same way.
 TEST(TestKabsch, ThreePointsAreEnough) {
   const Eigen::Matrix4d T = kabsch_algorithm(kabsch_i_general.topRows(3),
-                                             kabsch_j_general.topRows(3)).T_ji;
+                                             kabsch_j_general.topRows(3)).T_ji.matrix();
 
   EXPECT_LT((rotation_of(T) - R_kabsch).norm(), 1e-12);
   EXPECT_LT((translation_of(T) - t_kabsch).norm(), 1e-12);
@@ -539,7 +544,7 @@ TEST(TestKabsch, ThreePointsAreEnough) {
 TEST(TestKabsch, IndependentOfCorrespondenceOrder) {
   const PointCloud ri = kabsch_i_general.colwise().reverse();
   const PointCloud rj = kabsch_j_general.colwise().reverse();
-  const Eigen::Matrix4d T = kabsch_algorithm(ri, rj).T_ji;
+  const Eigen::Matrix4d T = kabsch_algorithm(ri, rj).T_ji.matrix();
 
   EXPECT_LT((rotation_of(T) - R_kabsch).norm(), 1e-12);
   EXPECT_LT((translation_of(T) - t_kabsch).norm(), 1e-12);
@@ -550,8 +555,8 @@ TEST(TestKabsch, IndependentOfCorrespondenceOrder) {
 // E carries no translation magnitude. Catches an i/j mix-up, which is
 // otherwise invisible: both orders produce a plausible rigid transform.
 TEST(TestKabsch, SwappingCloudsInvertsTheTransform) {
-  const Eigen::Matrix4d T = kabsch_algorithm(kabsch_i_general, kabsch_j_general).T_ji;
-  const Eigen::Matrix4d T_swapped = kabsch_algorithm(kabsch_j_general, kabsch_i_general).T_ji;
+  const Eigen::Matrix4d T = kabsch_algorithm(kabsch_i_general, kabsch_j_general).T_ji.matrix();
+  const Eigen::Matrix4d T_swapped = kabsch_algorithm(kabsch_j_general, kabsch_i_general).T_ji.matrix();
 
   EXPECT_LT((T_swapped - T.inverse()).norm(), 1e-12);
 }
@@ -563,7 +568,7 @@ TEST(TestKabsch, CommonShiftLeavesRotationUnchanged) {
   const Eigen::Vector3d shift{10, -5, 7};
   const PointCloud si = kabsch_i_general.rowwise() + shift.transpose();
   const PointCloud sj = kabsch_j_general.rowwise() + shift.transpose();
-  const Eigen::Matrix4d T = kabsch_algorithm(si, sj).T_ji;
+  const Eigen::Matrix4d T = kabsch_algorithm(si, sj).T_ji.matrix();
 
   EXPECT_LT((rotation_of(T) - R_kabsch).norm(), 1e-12);
   // the same rigid motion, re-expressed about a shifted origin
@@ -575,7 +580,7 @@ TEST(TestKabsch, CommonShiftLeavesRotationUnchanged) {
 // formulation, stated as a test: depth removes the degeneracy rather than
 // improving the conditioning.
 TEST(TestKabsch, CoplanarInputIsExact) {
-  const Eigen::Matrix4d T = kabsch_algorithm(kabsch_i_coplanar, kabsch_j_coplanar).T_ji;
+  const Eigen::Matrix4d T = kabsch_algorithm(kabsch_i_coplanar, kabsch_j_coplanar).T_ji.matrix();
 
   EXPECT_LT((rotation_of(T) - R_kabsch).norm(), 1e-12);
   EXPECT_LT((translation_of(T) - t_kabsch).norm(), 1e-12);
@@ -590,7 +595,7 @@ TEST(TestKabsch, CoplanarInputIsExact) {
 // can. The recovered R is not asserted on, because Eigen and numpy pick
 // different members of the same degenerate subspace.
 TEST(TestKabsch, CollinearInputStillLooksValid) {
-  const Eigen::Matrix4d T = kabsch_algorithm(kabsch_i_collinear, kabsch_j_collinear).T_ji;
+  const Eigen::Matrix4d T = kabsch_algorithm(kabsch_i_collinear, kabsch_j_collinear).T_ji.matrix();
   const Eigen::Matrix3d R = rotation_of(T);
 
   EXPECT_LT((R.transpose() * R - Eigen::Matrix3d::Identity()).norm(), 1e-12);
@@ -602,7 +607,7 @@ TEST(TestKabsch, CollinearInputStillLooksValid) {
 // catastrophic. Guards against a change that passes every exact test above and
 // degrades badly on real data, which is the only kind this will ever see.
 TEST(TestKabsch, NoisyInputStaysClose) {
-  const Eigen::Matrix4d T = kabsch_algorithm(kabsch_i_noisy, kabsch_j_noisy).T_ji;
+  const Eigen::Matrix4d T = kabsch_algorithm(kabsch_i_noisy, kabsch_j_noisy).T_ji.matrix();
 
   EXPECT_LT(angle_between(rotation_of(T), R_kabsch), 0.5 * M_PI / 180.0);
   EXPECT_LT((translation_of(T) - t_kabsch).norm(), 0.03);
@@ -688,15 +693,15 @@ TEST(TestRansacKabsch, RecoversTransformDespiteOutliers) {
 
   const auto fit = kabsch_ransac(P, Q);
 
-  EXPECT_LT(angle_between(fit.T_ji.topLeftCorner<3, 3>(), R), 1e-9);
-  EXPECT_LT((fit.T_ji.topRightCorner<3, 1>() - t).norm(), 1e-9);
+  EXPECT_LT(angle_between(fit.T_ji.rotation().matrix(), R), 1e-9);
+  EXPECT_LT((fit.T_ji.translation() - t).norm(), 1e-9);
   EXPECT_EQ(fit.inliers.size(), static_cast<size_t>(n - n_out));
   // no planted outlier survived
   EXPECT_TRUE(std::none_of(fit.inliers.begin(), fit.inliers.end(),
                            [n_out](Eigen::Index i) { return i < n_out; }));
 
   // the contrast that justifies the ticket
-  const Eigen::Matrix4d naive = kabsch_algorithm(P, Q).T_ji;
+  const Eigen::Matrix4d naive = kabsch_algorithm(P, Q).T_ji.matrix();
   EXPECT_GT(angle_between(naive.topLeftCorner<3, 3>(), R), 1e-3);
 }
 
@@ -716,4 +721,80 @@ TEST(TestRansacKabsch, CollinearInputReportsFailure) {
 
   EXPECT_TRUE(fit.inliers.empty());
   EXPECT_EQ(fit.inlier_ratio, 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// Farthest-point sampling
+// ---------------------------------------------------------------------------
+
+namespace {
+  using geometry::camera::farthest_point_sample;
+
+  // Smallest distance between any two chosen points -- the quantity FPS exists
+  // to maximise, and the one that predicts whether a rigid fit is conditioned.
+  double min_pair_distance(const Eigen::MatrixX3d &points,
+                           const std::vector<Eigen::Index> &idx) {
+    double worst = std::numeric_limits<double>::infinity();
+    for (size_t a = 0; a + 1 < idx.size(); ++a)
+      for (size_t b = a + 1; b < idx.size(); ++b)
+        worst = std::min(worst, (points.row(idx[a]) - points.row(idx[b])).norm());
+    return worst;
+  }
+
+  // Two tight clusters far apart, plus a sparse bridge. A naive prefix takes
+  // only cluster A; FPS has to reach the far cluster and the bridge.
+  Eigen::MatrixX3d clustered_cloud() {
+    Eigen::MatrixX3d p(60, 3);
+    for (int k = 0; k < 25; ++k) p.row(k) << 0.01 * k, 0.0, 0.0;           // cluster A
+    for (int k = 0; k < 25; ++k) p.row(25 + k) << 10.0 + 0.01 * k, 0.0, 0.0;  // cluster B
+    for (int k = 0; k < 10; ++k) p.row(50 + k) << 0.0, 1.0 * (k + 1), 0.0;    // bridge
+    return p;
+  }
+}
+
+TEST(TestFarthestPointSample, ReturnsRequestedCountDistinct) {
+  const auto idx = farthest_point_sample(clustered_cloud(), 12);
+
+  EXPECT_EQ(idx.size(), 12u);
+  EXPECT_EQ(std::set<Eigen::Index>(idx.begin(), idx.end()).size(), 12u);
+  for (const auto i : idx) {
+    EXPECT_GE(i, 0);
+    EXPECT_LT(i, 60);
+  }
+}
+
+// K >= N is the top of a sweep ("use everything"), not a caller error. Returning
+// every index in order keeps that a valid request rather than an abort.
+TEST(TestFarthestPointSample, ClampsWhenAskedForMoreThanExists) {
+  const Eigen::MatrixX3d p = clustered_cloud();
+
+  for (const Eigen::Index k : {Eigen::Index{60}, Eigen::Index{10000}}) {
+    const auto idx = farthest_point_sample(p, k);
+    ASSERT_EQ(idx.size(), 60u);
+    for (Eigen::Index i = 0; i < 60; ++i) EXPECT_EQ(idx[i], i);
+  }
+}
+
+// The whole justification for FPS over p[:K]: spread, not count.
+TEST(TestFarthestPointSample, SpreadsFurtherThanNaivePrefix) {
+  const Eigen::MatrixX3d p = clustered_cloud();
+  const int k = 8;
+
+  std::vector<Eigen::Index> prefix(k);
+  std::iota(prefix.begin(), prefix.end(), 0);
+
+  const double fps = min_pair_distance(p, farthest_point_sample(p, k));
+  const double naive = min_pair_distance(p, prefix);
+
+  // prefix draws 8 points from a 0.25 m cluster; FPS must span 10 m of extent
+  EXPECT_GT(fps, 10.0 * naive);
+}
+
+TEST(TestFarthestPointSample, RejectsBadArgumentsInsteadOfAborting) {
+  const Eigen::MatrixX3d p = clustered_cloud();
+
+  // assert() would abort the process under a debug build and vanish entirely
+  // under NDEBUG; a throw survives both and reaches Python as a ValueError.
+  EXPECT_THROW(farthest_point_sample(p, 0), std::invalid_argument);
+  EXPECT_THROW(farthest_point_sample(p, -5), std::invalid_argument);
 }
