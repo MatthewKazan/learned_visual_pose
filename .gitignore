@@ -194,4 +194,10 @@ cython_debug/
 *.iml
 
 # data
-/data/tartan_air/
+/data/
+/notes/
+/checkpoints/
+/experiments/
+
+/CLAUDE.md
+/cmake-build-dev/

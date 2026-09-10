@@ -17,6 +17,7 @@ import traceback
 from dataclasses import dataclass, field, fields, replace
 from enum import StrEnum
 from functools import partial
+from typing import Callable
 
 import numpy as np
 import torch
@@ -28,7 +29,7 @@ from visual_pose.data_utils.constants import REPO_DIR
 from visual_pose.data_utils.dataset import TartanAirSequence
 from visual_pose.evaluation import metrics
 from visual_pose.geometry import relative_pose
-from visual_pose.models.global_descriptor import avg_pooling
+from visual_pose.models.global_descriptor import avg_pooling, gem_pooling
 from visual_pose.pose_graph.world_model import WorldModel
 from visual_pose.viz.run_log import DEFAULT_ROOT, RunWriter
 
@@ -54,6 +55,7 @@ class Variant:
     ransac: bool = True                    # which robust estimator, not a wrapper
     graph_solver: GraphSolver = GraphSolver.NONE
     config: Config = field(default_factory=Config)
+    pooling_fn: Callable[[torch.Tensor], torch.Tensor] = gem_pooling
 
     @property
     def metric(self) -> bool:
@@ -140,14 +142,21 @@ BASE = Config(
     loop_retrieval_similarity=0.94,
     loop_min_inliers=25,
     val_frame_gap=2,
-    loop_min_gap=25,
-    loop_max_candidates=80,
-
+    loop_min_gap=50,
+    loop_max_candidates=500,
+    # How the candidate budget is spent. P006, otherwise identical settings:
+    #   topk    spans collapse to a 16-kf band (153-169)     ATE 0.268
+    #   random  spans 54-147, 17/500 verified                ATE 0.266
+    #   span    spans 64-169, 153/500 verified               ATE 0.257
+    # Does NOT transfer: same config gives -48% on P001, -3.5% on P000 and
+    # +2.2% on P002, which has no true revisit beyond span 100.
+    loop_selection="span",
+    loop_span_bands=8,
 )
 
 COMMON = [
     Variant(EdgeSolver.KABSCH, ransac=True,
-            graph_solver=GraphSolver.GAUSS_NEWTON, config=BASE),
+            graph_solver=GraphSolver.GAUSS_NEWTON, config=BASE, pooling_fn=gem_pooling),
     # Variant(EdgeSolver.KABSCH, ransac=False, config=BASE, graph_solver=GraphSolver.GAUSS_NEWTON),
     # Variant(EdgeSolver.KABSCH, ransac=False, config=BASE),
     # Variant(EdgeSolver.EIGHT_POINT, ransac=False, config=BASE),
@@ -163,10 +172,29 @@ RUNS = {
     "P001": COMMON,
     "P000": COMMON,
 
-    # "P006": sweep(COMMON[0], "loop_min_inliers", [10, 25, 40, 60]),
-    # "P006": sweep(sweep(COMMON[0], "huber", [0.0, 0.5]), "seed", [0, 1]),
-    # "P003": COMMON + [Variant(EdgeSolver.KABSCH, ransac=True,
-    #                           config=replace(BASE, note="wide"))],
+    # ---- sweeps run 2026-09-09, P006 unless noted ---------------------------
+    # selection policy, everything else at BASE:
+    #   "P006": sweep(COMMON[0], "loop_selection", ["topk", "random", "span"]),
+    #
+    # candidate budget. U-curve: too few under-constrains, too many stacks
+    # correlated edges on the same revisit event and the graph over-trusts them.
+    #   25 -> 0.291   100 -> 0.275   200 -> 0.262   500 -> 0.257
+    #   1500 -> 0.285  3000 -> 0.303   (all closures accurate, 0-1 over 5 deg)
+    #   "P006": sweep(COMMON[0], "loop_max_candidates", [25, 100, 200, 500, 1500, 3000]),
+    #
+    # huber: identical ATE at 0, 2, 5. There are no outlier closures for it to
+    # suppress; it is the wrong tool for correlated ones.
+    #   "P006": sweep(COMMON[0], "huber", [0.0, 2.0, 5.0]),
+    #
+    # loop_retrieval_similarity: byte-identical results at 0.94 and 0.98. The
+    # fingerprint gives 5.2% precision against a 5.2% base rate, so the
+    # threshold admits the whole pool and verification does the discriminating.
+    #   "P006": sweep(COMMON[0], "loop_retrieval_similarity", [0.94, 0.98]),
+    #
+    # bands x span floor: lgap50 beat lgap100 everywhere (0.257-0.264 vs
+    # 0.264-0.271) -- the 50-100 band holds ~500 genuine revisit pairs.
+    #   "P006": sweep(sweep(COMMON[0], "loop_span_bands", [3, 5, 8]),
+    #                 "loop_min_gap", [50, 100]),
 }
 
 # ---- solver -----------------------------------------------------------------
@@ -216,15 +244,18 @@ DESCRIBE = {
     "seed": lambda x: f"seed{x}",
     "loop_min_gap": lambda x: f"lgap{x}",
     "loop_min_inliers": lambda x: f"linl{x}",
+    "loop_max_dist": lambda x: f"ldist{x:g}",
     "loop_retrieval_similarity": lambda x: f"lret{x:g}",
     "loop_max_candidates": lambda x: f"lcap{x}",
+    "loop_selection": lambda x: f"sel-{x}",
+    "loop_span_bands": lambda x: f"bands{x}",
     "weight_edges": lambda x: "weighted" if x else "unweighted",
     "huber": lambda x: f"huber{x:g}",
 }
 FRONTEND_FIELDS = ("run_name", "max_edges", "max_depth", "similarity_threshold",
-                   "seed", "loop_min_gap", "loop_min_inliers",
+                   "seed", "loop_min_gap", "loop_min_inliers", "loop_max_dist",
                    "loop_retrieval_similarity",
-                   "loop_max_candidates")
+                   "loop_max_candidates", "loop_selection", "loop_span_bands")
 GRAPH_FIELDS = ("weight_edges", "huber")
 
 SCENES = {scene: list(variants) for scene, variants in RUNS.items()}
@@ -345,7 +376,7 @@ def run_variant(variant: Variant, scene: str, sequence, model, run) -> None:
     # other's draws and reordering RUNS changes every number
     cpp.set_seed(cfg.seed)
 
-    world = WorldModel(model, avg_pooling, sequence, cfg,
+    world = WorldModel(model, variant.pooling_fn, sequence, cfg,
                        variant.edge_function, variant.graph_function or (lambda g: None))
     run.declare_track(front, show_edges=True)
 
@@ -379,9 +410,41 @@ def run_variant(variant: Variant, scene: str, sequence, model, run) -> None:
 
     candidates, _ = stage("loop candidates", lambda: world.loop_candidates(frames))
     if candidates is not None:
-        accepted = sum(world.add_edge(i, j) for i, j in candidates)
-        print(f"    {'loop closures':22s} {accepted}/{len(candidates)} verified")
-        run.note(f"{accepted}/{len(candidates)} loop closures verified")
+        closures: list[tuple[int, int]] = []
+        closure_est: list[np.ndarray] = []
+        for i, j in candidates:
+            if not world.add_edge(i, j):
+                continue
+            closure_est.append(
+                world.factor_graph.edges[-1].measured_pose.inverse().matrix())
+            closures.append((i, j))
+        print(f"    {'loop closures':22s} {len(closures)}/{len(candidates)} verified")
+        run.note(f"{len(closures)}/{len(candidates)} loop closures verified")
+
+        if closures:
+            # p95 as well as p50: a false closure at wide baseline still scores a
+            # high inlier count, so it survives verification and hides in the tail
+            # rather than moving the median.
+            ce = np.array([metrics.pose_error(T, T_gt) for T, T_gt
+                           in zip(closure_est, edge_truth(sequence, closures))])
+            for tag, q in (("p50", 50), ("p95", 95)):
+                rot, direction, magnitude = np.nanpercentile(ce, q, axis=0)
+                print(f"    {'closure err ' + tag:22s} rot {rot:.2f} deg, "
+                      f"dir {direction:.2f} deg, |t| {magnitude:.2f} cm")
+            run.note(f"closure rot err p50 {np.nanmedian(ce[:, 0]):.2f} deg, "
+                     f"p95 {np.nanpercentile(ce[:, 0], 95):.2f} deg")
+
+            # Span in KEYFRAMES, the unit loop_min_gap is expressed in. A
+            # closure only corrects drift if it spans enough of the chain for
+            # error to have accumulated between its endpoints; spans piled up
+            # at the minimum gap add cycles that were never in tension.
+            at = {f: k for k, f in enumerate(frames)}
+            spans = np.array([abs(at[j] - at[i]) for i, j in closures])
+            print(f"    {'closure span (kf)':22s} min {spans.min()}, "
+                  f"p50 {int(np.median(spans))}, max {spans.max()}"
+                  f"  (chain is {len(frames) - 1} kf, gap {cfg.loop_min_gap})")
+            run.note(f"closure span kf min {spans.min()} "
+                     f"p50 {int(np.median(spans))} max {spans.max()}")
 
     errors = np.array([metrics.pose_error(T, T_gt) for T, T_gt in zip(estimates, gt)])
     chained = metrics.chain(estimates, gt, metric=variant.metric)
@@ -392,6 +455,10 @@ def run_variant(variant: Variant, scene: str, sequence, model, run) -> None:
     print(f"    {'odometry path':22s} {metrics.path_length(chained):.2f} m "
           f"(ground truth {metrics.path_length(gt_path):.2f} m)"
           + ("" if variant.metric else "  [|t| borrowed from GT]"))
+    # chain(gt, gt) rather than gt_path: both fold the SAME pair list, so a
+    # bridged edge cannot slide the two paths out of correspondence.
+    odom_ate = metrics.ate(chained, metrics.chain(gt, gt, metric=True))
+    print(f"    {'odometry ATE':22s} {odom_ate:.3f} m")
 
     if variant.wants_graph:
         track = twin_label(variant, front)
@@ -402,6 +469,19 @@ def run_variant(variant: Variant, scene: str, sequence, model, run) -> None:
             positions = np.array(world.factor_graph.poses())[:, :3, 3]
             print(f"    {'optimize':22s} {world.factor_graph}, "
                   f"path {metrics.path_length(positions):.2f} m")
+            # Vertices are keyed by sequence index, not creation order: a loop
+            # candidate whose endpoint was bridged is added as odometry and
+            # appends a vertex out of frame order. Read the mapping, do not
+            # assume vertex k is frames[k].
+            order = sorted(world.vertex_index, key=world.vertex_index.get)
+            into_v0 = np.linalg.inv(sequence.pose(order[0]))
+            gt_vertices = np.array(
+                [(into_v0 @ sequence.pose(f))[:3, 3] for f in order])
+            graph_ate = metrics.ate(positions, gt_vertices)
+            print(f"    {'ATE odometry -> graph':22s} "
+                  f"{odom_ate:.3f} m -> {graph_ate:.3f} m"
+                  f"  ({100 * (graph_ate - odom_ate) / odom_ate:+.1f}%)")
+            run.note(f"ATE {odom_ate:.3f} m -> {graph_ate:.3f} m")
 
     run.end(front)
 

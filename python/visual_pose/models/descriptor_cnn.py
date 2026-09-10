@@ -78,12 +78,12 @@ class DescriptorCNN(nn.Module):
             norm=cfg.norm,
         )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
         """
         x: (B, 3, H, W) RGB image, values in [0, 1]
         returns: (B, descriptor_dim, H', W') L2-normalized descriptors,
                  where H' = H / prod(strides), W' = W / prod(strides).
         """
-        x = self.backbone(x)
-        x = self.head(x)
-        return F.normalize(x, dim=1)
+        backbone = self.backbone(x)
+        x = self.head(backbone)
+        return F.normalize(x, dim=1), backbone

@@ -59,8 +59,8 @@ class WorldModel:
         rgb = self.sequence.rgb(seq_idx)
         image = (torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0).unsqueeze(0)
         image = image.to(self.descriptor_generator.device)
-        descriptors = self.descriptor_generator(image)
-        global_descriptor = self.pooling_method(descriptors)[0]
+        descriptors, backbone = self.descriptor_generator(image)
+        global_descriptor = self.pooling_method(backbone)[0]
         return KeyFrame(rgb, descriptors.detach(),
                         global_descriptor.detach().cpu().numpy())
 
@@ -115,10 +115,46 @@ class WorldModel:
             if candidates:
                 pairs.extend([(i, j) for j in candidates if similarity[i, j] >= self.cfg.loop_retrieval_similarity])
 
-        if self.cfg.loop_max_candidates:
-            pairs = sorted(pairs, key=lambda ab: -similarity[ab])
-            pairs = pairs[:self.cfg.loop_max_candidates]
+        if self.cfg.loop_max_candidates and len(pairs) > self.cfg.loop_max_candidates:
+            pairs = self._select(pairs, similarity, self.cfg.loop_max_candidates)
         return [(frames[i], frames[j]) for i, j in pairs]
+
+    def _select(self, pairs, similarity, budget: int):
+        """
+        Spend a candidate budget across `pairs`. See Config.loop_selection.
+
+        Seeded from cfg.seed: cpp.set_seed only reaches the C++ generator, so an
+        unseeded numpy draw here makes the whole run unrepeatable.
+        """
+        mode = self.cfg.loop_selection
+        if mode == "topk":
+            return sorted(pairs, key=lambda ab: -similarity[ab])[:budget]
+        if mode == "random":
+            rng = np.random.default_rng(self.cfg.seed)
+            return [pairs[k] for k in rng.permutation(len(pairs))[:budget]]
+        if mode != "span":
+            raise ValueError(f"unknown loop_selection {mode!r}, "
+                             "expected topk|random|span")
+
+        # Bands of equal span WIDTH, not equal population: the point is to give
+        # under-populated spans a share the global ranking never gives them.
+        spans = np.array([j - i for i, j in pairs])
+        edges = np.linspace(spans.min(), spans.max() + 1, self.cfg.loop_span_bands + 1)
+        band = np.digitize(spans, edges) - 1
+
+        by_band = []
+        for b in range(self.cfg.loop_span_bands):
+            members = [pairs[k] for k in np.nonzero(band == b)[0]]
+            by_band.append(sorted(members, key=lambda ab: -similarity[ab]))
+
+        # Smallest bands first, so a band that cannot spend its share hands the
+        # remainder to the others instead of leaving the budget unfilled.
+        out, remaining = [], budget
+        for n, ranked in enumerate(sorted(by_band, key=len)):
+            share = remaining // (self.cfg.loop_span_bands - n)
+            out.extend(ranked[:share])
+            remaining -= min(share, len(ranked))
+        return out
 
     # -- graph --------------------------------------------------------------
 

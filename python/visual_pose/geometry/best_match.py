@@ -147,8 +147,8 @@ def get_matching_pairs(model: nn.Module, images_i: Tensor,
     # from different pairs into one list
     assert images_i.shape[0] == 1, "only batch size 1 is supported"
 
-    descriptors_i = model(images_i)
-    descriptors_j = model(images_j)
+    descriptors_i = model(images_i)[0]
+    descriptors_j = model(images_j)[0]
     return get_matching_pairs_from_descriptors(
         descriptors_i, descriptors_j, tuple(images_i.shape[2:]), similarity_threshold)
 

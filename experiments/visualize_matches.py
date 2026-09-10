@@ -74,7 +74,7 @@ def analyse(model, batch):
     image_shape = tuple(images_j.shape[2:])
 
     queries, feature_i = descriptors_at(model, images_i, uvs_i)   # (1,N,D), (1,D,H',W')
-    feature_j = model(images_j)                                   # (1,D,H',W')
+    feature_j = model(images_j)[0]                                # (1,D,H',W')
 
     # Predictions come from best_match itself rather than a local reimplementation.
     # The version that used to live here carried its own cell->pixel arithmetic,

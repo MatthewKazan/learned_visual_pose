@@ -14,3 +14,8 @@ def avg_pooling(descriptors: torch.Tensor):
         descriptors,
         dim=(-2,-1)
     ), dim=-1)
+
+
+def gem_pooling(descriptors: torch.Tensor, p: int = 3):
+    sum_desc = torch.sum(descriptors ** p, dim=(-2, -1))
+    return F.normalize(torch.pow(sum_desc, 1.0 / p), dim=-1)

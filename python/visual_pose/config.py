@@ -95,24 +95,42 @@ class Config:
     # per-cell descriptor cosine for matching. On P001 closures 0.70 -> 0.80
     # halves the error (0.62 -> 0.28 deg) at 3.4x fewer matches; past 0.85
     # RANSAC finds no consensus.
-    similarity_threshold: float = 0.7
+    similarity_threshold: float = 0.8
 
     # metres a closure may disagree with the odometry chain. Measured: true
-    # closures disagree 0.06-0.22 m, false ones 4.91-5.00 m.
+    # closures disagree 0.06-0.22 m, false ones 4.91-5.00 m. Load-bearing:
+    # relaxing it to 5 m on P000 admitted closures with a median translation
+    # error of 1.11 m and took ATE from 1.056 to 4.151 m.
     loop_max_dist: float = 2.0
-    loop_min_gap: int = 10            # keyframes apart to count as a loop
+    loop_min_gap: int = 50            # keyframes apart to count as a loop
     # absolute count, not the ratio: wrong closures had 3-8 inliers and right
     # ones 28-163, while the ratio fails both ways (real closures sit at
     # 0.04-0.12, a 3-of-5 fit reports 0.60 and is 179 deg wrong).
     loop_min_inliers: int = 25
-    # fingerprint cosine deciding which pairs are proposed. 99% precision at
-    # 18.4% recall on P003. Does not transfer: on P000 no threshold works,
-    # since the true revisits score below the false ones.
+    # fingerprint cosine deciding which pairs are proposed. Currently INERT:
+    # under backbone GeM pooling every eligible pair scores 0.97-0.99, so 0.94
+    # and 0.98 give byte-identical runs and precision equals the 5.2% base
+    # rate. Geometric verification is doing all the discriminating.
     loop_retrieval_similarity: float = 0.94
-    loop_max_candidates: int | None = None   # None = no cap
+    # U-curve on P006: 25 -> 0.291, 200 -> 0.262, 500 -> 0.257, 3000 -> 0.303 m
+    # ATE. Above the optimum the extra closures are still accurate, but they
+    # stack on the same revisit event and their information sums as though
+    # independent, so the graph over-trusts the loop.
+    loop_max_candidates: int | None = 500
+    # How the cap is spent. "topk" takes the highest cosines, which on P006
+    # collapsed to a 16-keyframe span band (153-169) because the most similar
+    # pairs cluster at the centre of the strongest overlap. "random" spreads
+    # but discards the ranking; "span" keeps it inside span bands.
+    # P006 ATE: topk 0.268, random 0.266, span 0.257.
+    loop_selection: str = "span"      # topk | random | span
+    loop_span_bands: int = 8          # bands for loop_selection="span"
 
     weight_edges: bool = True         # information-weight the graph edges
-    huber: float = 0.0                # robust kernel threshold; 0 = off
+    # Inert on every sequence measured (identical ATE at 0, 2, 5): there are no
+    # outlier closures for it to suppress. Kept as insurance, not as a fix --
+    # the failure mode that does bite is correlated closures, which a robust
+    # kernel cannot see.
+    huber: float = 2.0
     note: str = ""                    # free tag, shown on the plot label
 
     inlier_threshold: float = 0.05

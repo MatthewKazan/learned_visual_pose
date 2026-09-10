@@ -50,7 +50,14 @@ def ate(path: np.ndarray, gt_path: np.ndarray) -> float:
     """RMS position error against ground truth, metres. No alignment: the
     poses are metric, so a fitted scale would hide real error.
     """
-    pass
+    assert len(path) == len(gt_path)
+    sum_e = 0.0
+    # ignore the first point, it's always the same as ground truth
+    for i in range(1, len(path)):
+        sum_e += np.linalg.norm(path[i] - gt_path[i]) ** 2
+
+    return np.sqrt(sum_e / (len(path) - 1))
+
 
 
 def drift(path: np.ndarray, gt_path: np.ndarray) -> tuple[float, float]:

@@ -69,7 +69,7 @@ def descriptors_at(model: nn.Module, images: Tensor,
     feature_map (B,D,H',W')). The map comes back too because eval needs the
     whole thing as a candidate pool.
     """
-    descriptors = model(images)
+    descriptors = model(images)[0]
 
     # u scales by width, v by height. Crossing them is silent when the strides
     # are equal, so it lives in one place. Must match cells_to_pixels.
@@ -132,7 +132,7 @@ def test_model(model: nn.Module, data_loader: DataLoader,
                 images_j, uvs_j = images_i, uvs_i
 
             sampled_descriptors_i, descriptors_i = descriptors_at(model, images_i, uvs_i)
-            descriptors_j = model(images_j)   # (B, D, H', W')
+            descriptors_j = model(images_j)[0]   # (B, D, H', W')
 
             pixel_error, offset = descriptor_error(sampled_descriptors_i, descriptors_j, images_j, uvs_j)
             errors.append(pixel_error.flatten())
