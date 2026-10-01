@@ -14,6 +14,7 @@ namespace geometry {
     RotationSO3 inverse() const;
     RotationSO3 operator*(const RotationSO3 &other) const;
     Eigen::Vector3d operator*(const Eigen::Vector3d &other) const;
+    double magnitude() const;
 
     static RotationSO3 exp(const Eigen::Vector3d &omega);
 

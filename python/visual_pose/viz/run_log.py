@@ -8,8 +8,8 @@ Writer side -- any process, any code, no matplotlib:
         for k, ... in enumerate(edges):
             run.frame(path_so_far, x=k, x_label="edge", **{"rot err (deg)": e})
 
-Reader side: `python -m visual_pose.viz.watch` tails the directory and plots
-whatever appears. Neither side imports the other, which is the point:
+Reader side: `python -m visual_pose.viz.rerun_app` tails the directory and
+draws whatever appears in rerun. Neither side imports the other, which is the point:
 
   * edit the estimator and re-run it as often as you like -- new process, new
     code, and the window never restarts
@@ -25,19 +25,38 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
 
 import numpy as np
 
 from visual_pose.data_utils.constants import REPO_DIR
-from visual_pose.viz.live_trajectory import positions_of
 
 DEFAULT_ROOT = REPO_DIR / "out" / "runs"
 
 SUFFIX = ".jsonl"
+
+
+def positions_of(poses) -> np.ndarray:
+    """
+    Translations as (N, 3), from any of: (N, 4, 4), a list of 4x4, a list of
+    PoseSE3, or already-plain (N, 2) / (N, 3) points.
+    """
+    seq = list(poses)
+    if seq and hasattr(seq[0], "translation"):
+        return np.array([np.asarray(p.translation(), float).ravel() for p in seq])
+    arr = np.asarray(seq, dtype=float)
+    if arr.ndim == 3:
+        return arr[:, :3, 3].copy()
+    if arr.ndim == 2 and arr.shape[1] == 2:
+        return np.c_[arr, np.zeros(len(arr))]
+    if arr.ndim == 2 and arr.shape[1] == 3:
+        return arr.copy()
+    raise ValueError(f"cannot read positions from shape {arr.shape}")
 
 
 def _slug(text: str) -> str:
@@ -114,6 +133,21 @@ class RunWriter:
     def end(self, track: str | None = None) -> None:
         """Freeze a track. Called for every open track on close."""
         self._write(kind="end", track=track or self.name)
+
+    def poses(self, track: str, frames, poses) -> None:
+        """A track's final (N, 4, 4) poses, T_0k in the first keyframe's camera
+        frame, and the sequence frame each belongs to. Rotation included, which
+        `frame` drops: the point-cloud viewer places depth with it."""
+        self._write(kind="poses", track=track, frames=[int(f) for f in frames],
+                    poses=np.round(np.asarray(poses, float), 6).tolist())
+
+    def summary(self, track: str, text: str) -> None:
+        """A one-line result the viewer appends to the track's legend entry."""
+        self._write(kind="summary", track=track, text=text)
+
+    def table(self, title: str, text: str) -> None:
+        """Preformatted text the viewer shows in its right column."""
+        self._write(kind="table", title=title, text=text)
 
     def note(self, text: str) -> None:
         """A line of console output worth keeping with the run."""
@@ -200,3 +234,78 @@ def summary(path: Path | str) -> dict:
             closed = True
     return {"name": name, "meta": meta, "tracks": tracks,
             "frames": frames, "closed": closed, "path": Path(path)}
+
+
+# -- a finished run, as the viewer uses it -----------------------------------
+
+@dataclass
+class Prediction:
+    log: Path
+    track: str
+    name: str                 # short: "odometry", "+ gauss newton", ...
+    derived: bool             # the graph twin of another track
+    positions: np.ndarray     # (N, 3) in keyframe 0's OpenCV camera frame
+    ate: str | None
+    # From the "poses" record, which logs before 2026-09-30 lack: poses.txt
+    # frame of each pose, and T_0k with rotation (the 3D map needs it)
+    frames: np.ndarray | None = None
+    poses: np.ndarray | None = None
+
+
+@dataclass
+class RunEntry:
+    log: Path
+    when: str                 # "09-29 16:21"
+    config: str               # the variant label minus the scene
+    predictions: list[Prediction]
+    reference: np.ndarray     # the log's ground truth, same frame as positions
+
+
+def read_run_log(path: Path) -> RunEntry:
+    """Last frame of every track, plus its ATE: summary records, or the older
+    "ATE a m -> b m" note, which names (odometry, graph) in that order."""
+    records = []
+    with path.open() as f:
+        for line in f:
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass              # a run still writing its last line
+    meta = records[0]
+    scene = meta.get("name", "")
+    last, hints, ate, full, noted = {}, {}, {}, {}, None
+    reference = np.zeros((0, 3))
+    for r in records:
+        kind = r.get("kind")
+        if kind == "frame":
+            last[r["track"]] = r["positions"]
+        elif kind == "track":
+            hints[r["track"]] = r
+        elif kind == "summary":
+            ate[r["track"]] = r["text"]
+        elif kind == "poses":
+            full[r["track"]] = (np.array(r["frames"]), np.array(r["poses"], float))
+        elif kind == "reference" and not len(reference):
+            reference = np.array(r["positions"], float)
+        elif kind == "note":
+            m = re.fullmatch(r"ATE ([\d.]+) m -> ([\d.]+) m", r.get("text", ""))
+            noted = m.groups() if m else noted
+
+    fronts = [t for t in last if not hints.get(t, {}).get("derived_from")]
+    predictions = []
+    for track, positions in last.items():
+        parent = hints.get(track, {}).get("derived_from")
+        name = (track[len(parent):].strip() if parent and track.startswith(parent)
+                else "odometry" if len(fronts) == 1
+                else track.replace(f" - {scene}", ""))
+        text = ate.get(track)
+        if text is None and noted and len(last) == 2:
+            text = f"ATE {noted[1 if parent else 0]} m"
+        predictions.append(Prediction(path, track, name, bool(parent),
+                                      np.array(positions, float), text,
+                                      *full.get(track, (None, None))))
+    stamp = path.name[:15]    # RunWriter names files YYYYmmdd-HHMMSS_...
+    return RunEntry(
+        log=path, when=f"{stamp[4:6]}-{stamp[6:8]} {stamp[9:11]}:{stamp[11:13]}",
+        config=fronts[0].replace(f" - {scene}", "") if len(fronts) == 1 else f"{len(fronts)} variants",
+        predictions=predictions, reference=reference)

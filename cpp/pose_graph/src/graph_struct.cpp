@@ -153,36 +153,77 @@ namespace pose_graph {
     }
   }
 
-  void FactorGraph::gauss_newton(const double iter_threshold, const bool verbose, const double huber) {
+  void FactorGraph::gauss_newton(const double iter_threshold, const bool verbose, const double huber, const double lm_lambda_init) {
     if (vertices.size() < 2) {
       throw std::invalid_argument("gauss_newton needs at least 2 vertices");
     }
-    float delta_mag = std::numeric_limits<float>::infinity();
-
     // Gauss-Newton can diverge, and an unbounded loop turns that into a hang
-    // rather than a diagnosable result.
+    // rather than a diagnosable result. Rejected LM steps count too, so a
+    // stalled run ends after ~10 rejections of one step, not never.
     constexpr int max_iterations = 100;
     int iterations = 0;
+
+    // Levenberg-Marquardt when lm_lambda_init > 0: the step is judged at the
+    // START of the next iteration, where the fresh residuals already are. A
+    // step that raised the cost is undone from `saved`, lambda grows and the
+    // same linearisation point is retried with a shorter step; a step that
+    // lowered it shrinks lambda. lambda = 0 is plain Gauss-Newton.
+    const bool damped = lm_lambda_init > 0.0;
+    double lambda = lm_lambda_init;
+    double prev_cost = std::numeric_limits<double>::infinity();
+    double delta_mag = std::numeric_limits<double>::infinity();   // of the last ACCEPTED step
+    std::vector<geometry::PoseSE3> saved(vertices.size());
+    bool pending = false;                                          // a step is applied but not yet judged
 
     Eigen::VectorXd residuals(6 * edges.size());
     Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> H(6*vertices.size(), 6*vertices.size());
     Eigen::VectorXd b(6 * vertices.size());
 
+    // residuals at the current poses, and their weighted sum of squares
+    const auto evaluate = [&]() {
+      double cost = 0.0;
+      for (size_t e = 0; e < edges.size(); ++e) {
+        const Edge &edge = edges[e];
+        const geometry::PoseSE3 trans_error = edge.measured_pose.inverse() * vertices[edge.from].pose.inverse() * vertices[edge.to].pose;
+        residuals.segment<6>(e * 6) = trans_error.log();
+        const auto r = residuals.segment<6>(e * 6);
+        cost += r.dot(edge.info_matrix * r);
+      }
+      return cost;
+    };
+
     while (delta_mag > iter_threshold && iterations++ < max_iterations) {
+      const double cost = evaluate();
+
+      if (damped && pending) {
+        pending = false;
+        if (cost > prev_cost) {
+          for (size_t v = 0; v < vertices.size(); ++v) vertices[v].pose = saved[v];
+          lambda *= 10.0;
+          delta_mag = std::numeric_limits<double>::infinity();   // a rejected step must not end the loop
+          if (verbose) std::cout << "  iter " << iterations << "  cost " << cost << " > " << prev_cost << "  rejected, lambda " << lambda << '\n';
+          continue;                                              // re-evaluates at the restored poses
+        }
+        lambda = std::max(lambda / 3.0, 1e-9);
+      }
+      prev_cost = cost;
+      if (verbose) {
+        std::cout << "  iter " << iterations << "  cost " << cost << "  |delta| " << delta_mag;
+        if (damped) std::cout << "  lambda " << lambda;
+        std::cout << '\n';
+      }
+
       H.setZero();
       b.setZero();
-
-      for (int i = 0; i < edges.size(); i++) {
+      for (size_t i = 0; i < edges.size(); i++) {
         Edge &edge = edges[i];
-        geometry::PoseSE3 trans_error = edge.measured_pose.inverse() * vertices[edge.from].pose.inverse() * vertices[edge.to].pose;
-        residuals.segment<6>(i * 6) = trans_error.log();
+        const auto r = residuals.segment<6>(i * 6);
 
         Eigen::Matrix<double, 6, 6> J_i = -vertices[edge.to].pose.inverse().adjoint();
         Eigen::Matrix<double, 6, 6> J_j = vertices[edge.to].pose.inverse().adjoint();
 
         double w = 1;
         if (huber != 0.0) {
-          const auto r = residuals.segment<6>(i * 6);
           const double mahalanobis = std::sqrt(r.dot(edge.info_matrix * r));
           w = std::min(1.0, huber / mahalanobis);
         }
@@ -192,11 +233,15 @@ namespace pose_graph {
         H.block<6,6>(edge.from*6,edge.to*6) += w * J_i.transpose() * edge.info_matrix * J_j;
         H.block<6,6>(edge.to*6,edge.to*6) += w * J_j.transpose() * edge.info_matrix * J_j;
 
-        b.segment<6>(edge.from*6) += w * -J_i.transpose() * edge.info_matrix * residuals.segment<6>(i * 6);
-        b.segment<6>(edge.to*6) += w * -J_j.transpose() * edge.info_matrix * residuals.segment<6>(i * 6);
-
-
+        b.segment<6>(edge.from*6) += w * -J_i.transpose() * edge.info_matrix * r;
+        b.segment<6>(edge.to*6) += w * -J_j.transpose() * edge.info_matrix * r;
       }
+      // Marquardt damping: scale the diagonal so the step shortens most in the
+      // directions the data constrains least. The floor keeps a direction with
+      // ~zero curvature (a stretch held only by near-zero information) from
+      // getting an unbounded step; with lambda = 0 this line is a no-op.
+      H.diagonal() += lambda * (H.diagonal().array() + 1e-6).matrix();
+
       // Gauge fix: absolute poses are defined only up to one global rigid
       // transform, so H is singular by exactly 6. Vertex 0 is the anchor -- drop
       // its rows and columns rather than solve a singular system, because LDLT
@@ -218,17 +263,6 @@ namespace pose_graph {
         return;
       }
       const Eigen::VectorXd delta = solver.solve(b_reduced);
-      delta_mag = delta.norm();
-
-      if (verbose) {
-        double cost = 0.0;
-        for (size_t e = 0; e < edges.size(); ++e) {
-          const auto r = residuals.segment<6>(e * 6);
-          cost += r.transpose() * edges[e].info_matrix * r;
-        }
-        std::cout << "  iter " << iterations << "  cost " << cost
-                  << "  |delta| " << delta_mag << '\n';
-      }
 
       // Diverging to NaN silently replaces every pose with garbage. Bail out and
       // leave the graph as it was rather than destroy the caller's trajectory.
@@ -237,6 +271,7 @@ namespace pose_graph {
         return;
       }
 
+      for (size_t v = 0; v < vertices.size(); ++v) saved[v] = vertices[v].pose;
       for (size_t v = 1; v < vertices.size(); ++v) {
         // (v - 1) because vertex 0 was removed above; using v would hand each
         // vertex its neighbour's correction and read past the end of delta
@@ -244,9 +279,14 @@ namespace pose_graph {
             geometry::PoseSE3::exp(delta.segment<6>((v - 1) * 6));
         vertices[v].pose = update * vertices[v].pose;
       }
-
+      delta_mag = delta.norm();
+      pending = true;
     }
 
-
+    // The loop can end with a step applied but never judged.
+    if (damped && pending && evaluate() > prev_cost) {
+      for (size_t v = 0; v < vertices.size(); ++v) vertices[v].pose = saved[v];
+      if (verbose) std::cout << "  final step rejected\n";
+    }
   }
 }

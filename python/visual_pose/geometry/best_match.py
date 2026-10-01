@@ -156,7 +156,23 @@ def get_matching_pairs(model: nn.Module, images_i: Tensor,
 
 def get_matching_pairs_from_descriptors(descriptors_i, descriptors_j, image_shape,
                                         similarity_threshold):
-    """Same as get_matching_pairs but on already-encoded descriptor maps."""
+    """Same as get_matching_pairs but on already-encoded descriptor maps. One pair."""
+    return get_matching_pairs_batched(descriptors_i, descriptors_j, image_shape,
+                                      similarity_threshold)[0]
+
+
+def get_matching_pairs_batched(descriptors_i, descriptors_j, image_shape,
+                               similarity_threshold):
+    """
+    B pairs at once: (B, D, H', W') maps on each side, pair b is (i_b, j_b).
+    Returns a list of B (uv_i, uv_j), each (K_b, 2) image pixels.
+
+    best_match is batched throughout; only the threshold mask is per pair,
+    which is why this returns a list rather than one flattened array. The
+    cost is the (B, N, M) similarity, 92 MB per pair at N = M = 4800; on
+    MPS the per-pair time bottoms out at B = 4 (WorldModel.prefetch_matches).
+    """
+    batch = descriptors_i.shape[0]
     uv_i = gridify_uvs(
         flat_indices=arange(descriptors_i.shape[2] * descriptors_i.shape[3],
                             device=descriptors_i.device),
@@ -164,7 +180,7 @@ def get_matching_pairs_from_descriptors(descriptors_i, descriptors_j, image_shap
         image_shape=image_shape
     )
     # every batch element queries the same grid, so this is a stride-0 view
-    uv_i = uv_i.expand(1, -1, -1)
+    uv_i = uv_i.expand(batch, -1, -1)
 
     query_descriptors = descriptors_i.permute(0, 2, 3, 1).flatten(1, 2)
 
@@ -178,4 +194,4 @@ def get_matching_pairs_from_descriptors(descriptors_i, descriptors_j, image_shap
     assert best_uv_js.shape == uv_i.shape, "mismatch in shape between query descriptors and best matches"
 
     mask = mutual & (scores > similarity_threshold)
-    return uv_i[mask], best_uv_js[mask]
+    return [(uv_i[b][mask[b]], best_uv_js[b][mask[b]]) for b in range(batch)]

@@ -83,4 +83,9 @@ namespace geometry {
     return R_ * other;
   }
 
+  double RotationSO3::magnitude() const {
+    const double cos_theta = std::clamp((R_.trace() - 1.0) / 2.0, -1.0, 1.0);
+    return std::acos(cos_theta);
+  }
+
 }

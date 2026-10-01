@@ -97,11 +97,6 @@ class Config:
     # RANSAC finds no consensus.
     similarity_threshold: float = 0.8
 
-    # metres a closure may disagree with the odometry chain. Measured: true
-    # closures disagree 0.06-0.22 m, false ones 4.91-5.00 m. Load-bearing:
-    # relaxing it to 5 m on P000 admitted closures with a median translation
-    # error of 1.11 m and took ATE from 1.056 to 4.151 m.
-    loop_max_dist: float = 2.0
     loop_min_gap: int = 50            # keyframes apart to count as a loop
     # absolute count, not the ratio: wrong closures had 3-8 inliers and right
     # ones 28-163, while the ratio fails both ways (real closures sit at
@@ -124,8 +119,48 @@ class Config:
     # P006 ATE: topk 0.268, random 0.266, span 0.257.
     loop_selection: str = "span"      # topk | random | span
     loop_span_bands: int = 8          # bands for loop_selection="span"
+    # Closure gate: Mahalanobis d^2 of a closure against the odometry chain's
+    # accumulated covariance (WorldModel.chain_consistent_gate). Replaced a
+    # 2 m disagreement limit, which encoded TartanAir's drift and rejected
+    # every closure spanning a bad edge on HM3D. Not the chi^2(6) quantile
+    # (12.6): chain drift is correlated, so the random-walk covariance runs
+    # 4-8x under actual drift on TartanAir. Measured 2026-09-29 on P000, P003,
+    # P006 and HM3D trajectory_20: true closures d^2 < 75, false ones > 3800.
+    closure_gate_threshold: float = 300.0
+    # Dense verification of a closure: fraction of frame i's pixels that, pushed
+    # through its depth and the fitted transform, land on frame j's surface
+    # within closure_depth_tolerance of their predicted depth. A degenerate fit
+    # explains only the patch it matched: the wall closure on 00801
+    # trajectory_23 (rotation right, translation 8 m off, 33 inliers, d^2 5.3
+    # under the chain gate) scored 0.33 while 156 true closures scored 0.55-0.96.
+    # Under ground truth true pairs score 0.92 (HM3D) and 0.54 (P000, occlusion
+    # at wide baseline); shifted 0.5 m, under 0.1. Relative tolerance because
+    # depth precision scales with depth on both datasets. Cannot see a wrong
+    # translation on far-only geometry (P000's false closures score 0.68); the
+    # chain gate covers those. Measured 2026-09-29.
+    closure_depth_tolerance: float = 0.02
+    closure_min_agreement: float = 0.35
 
     weight_edges: bool = True         # information-weight the graph edges
+    # edge_information sums one term per inlier, which is right only if point
+    # errors are independent. Against ground truth the Mahalanobis d^2 of an
+    # odometry edge grew with its inlier count, d^2/N = 0.10-0.21 on both
+    # datasets (chi^2(6) median 5.35 wants 0.003 at N=1800), so the errors are
+    # shared -- depth bias, descriptor localisation -- and an edge is worth
+    # about this many independent points however many it matched.
+    edge_effective_inliers: int = 40
+    # An odometry edge below this many inliers is kept (refusing it forks the
+    # chain) but with an "unknown" covariance instead of one from its own
+    # residuals: 5 inliers on a blank wall gave a 103 deg edge with a
+    # centimetre-level covariance (HM3D trajectory_20, frames 336-344), and
+    # the closure gate can only route around a bad edge whose covariance
+    # admits it. Good odometry edges have ~1800 inliers; the bad ones had 5 and 21.
+    # 100 declared good 93-inlier edges unknown and cut the anchor loose; 50 over
+    # 24 HM3D trajectories: mean graph ATE 0.37 -> 0.20 m, trajectory_08 3.12 ->
+    # 0.33 m, one sequence worse by 0.06 m (2026-09-29).
+    odometry_min_inliers: int = 50
+    unknown_edge_sigma_t: float = 1.0    # metres
+    unknown_edge_sigma_r: float = 0.52   # radians, ~30 deg
     # Inert on every sequence measured (identical ATE at 0, 2, 5): there are no
     # outlier closures for it to suppress. Kept as insurance, not as a fix --
     # the failure mode that does bite is correlated closures, which a robust
@@ -135,6 +170,8 @@ class Config:
 
     inlier_threshold: float = 0.05
     degeneracy_threshold: float = 0.001
+
+    lm_lambda_init: float = 1.0
 
     @property
     def checkpoint_dir(self) -> Path:

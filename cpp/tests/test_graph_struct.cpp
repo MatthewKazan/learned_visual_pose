@@ -344,6 +344,54 @@ TEST(TestGaussNewton, ConvergesToTruthOnExactMeasurements) {
   }
 }
 
+// Damping off is plain Gauss-Newton; damping on must reach the same optimum
+// from the same small perturbation, not a nearby one.
+TEST(TestGaussNewton, LevenbergMarquardtReachesTheSameOptimum) {
+  std::vector<geometry::PoseSE3> truth;
+  FactorGraph g = exact_graph(&truth);
+  nudge(g, 0.02);
+
+  g.gauss_newton(1e-10, false, 0.0, 1e-3);
+
+  EXPECT_LT(total_cost(g), 1e-16);
+  for (size_t v = 0; v < truth.size(); ++v) {
+    EXPECT_LT((g.vertices[v].pose.matrix() - truth[v].matrix()).norm(), 1e-6)
+        << "vertex " << v;
+  }
+}
+
+// The reason damping exists. A far start (up to ~2 rad of rotation on the last
+// vertex) and badly scaled weights (1e-6 next to 1e6) leave the linearisation
+// untrustworthy; undamped Gauss-Newton may overshoot or blow up. Damped, every
+// accepted step lowers the cost, so the end is never worse than the start and
+// never non-finite. Prints the undamped outcome so the comparison is visible.
+TEST(TestGaussNewton, LevenbergMarquardtNeverRaisesTheCost) {
+  std::vector<geometry::PoseSE3> truth;
+  FactorGraph start = exact_graph(&truth);
+  nudge(start, 1.2);   // vertex 3 gets 3.6 rad of twist: past pi, so the linearisation is nonsense at first
+  start.edges[1].info_matrix = 1e-6 * Information::Identity();
+  start.edges[3].info_matrix = 1e6 * Information::Identity();
+  const double before = total_cost(start);
+
+  FactorGraph undamped = start;
+  undamped.gauss_newton(1e-10, false, 0.0, 0.0);
+  const double gn = total_cost(undamped);
+  std::cout << "  undamped: cost " << before << " -> " << gn << '\n';
+
+  FactorGraph damped = start;
+  damped.gauss_newton(1e-10, false, 0.0, 1e-3);
+  const double lm = total_cost(damped);
+  std::cout << "  damped:   cost " << before << " -> " << lm << '\n';
+
+  // What damping promises: finite, and no worse than the start. Not "better
+  // than undamped": both may reach the 1e-30 floor, where the comparison is noise.
+  ASSERT_TRUE(std::isfinite(lm));
+  EXPECT_LE(lm, before * (1 + 1e-9));
+  for (const Vertex &v : damped.vertices) {
+    EXPECT_TRUE(v.pose.matrix().allFinite());
+  }
+}
+
 // Already optimal: the solver must recognise it and not wander.
 TEST(TestGaussNewton, LeavesAnOptimalGraphAlone) {
   std::vector<geometry::PoseSE3> truth;

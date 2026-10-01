@@ -30,6 +30,12 @@ dev = [
                         # outside pip's isolated build env and needs
                         # -Dpybind11_DIR=$(.venv/bin/python -m pybind11 --cmakedir)
 ]
+habitat = [
+    "habitat-sim @ git+https://github.com/facebookresearch/habitat-sim.git@v0.3.4"
+]
+viz = [
+    "rerun-sdk",        # viz.rerun_app: the viewer for run logs and HM3D trajectories
+]
 
 [tool.scikit-build]
 # Package lives under python/, not the repo root, so this must be explicit.

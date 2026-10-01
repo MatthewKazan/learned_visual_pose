@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from visual_pose import _geometry as cpp
+
 
 def pose_error(T_est: np.ndarray | None,
                T_gt: np.ndarray) -> tuple[float, float, float]:
@@ -23,11 +25,12 @@ def pose_error(T_est: np.ndarray | None,
             100 * abs(np.linalg.norm(t) - np.linalg.norm(t_gt)))
 
 
-def chain(relative: list[np.ndarray | None], gt: list[np.ndarray],
-          metric: bool) -> np.ndarray:
-    """Fold relative poses into (N+1, 3) world positions. Positions only."""
+def chain_poses(relative: list[np.ndarray | None], gt: list[np.ndarray],
+                metric: bool) -> np.ndarray:
+    """Fold relative poses into (N+1, 4, 4) T_0k: camera k into the first
+    camera's frame. Rotation kept, for the point-cloud viewer."""
     T = np.eye(4)
-    out = [T[:3, 3].copy()]
+    out = [T.copy()]
     for T_est, T_gt in zip(relative, gt):
         if T_est is None:
             out.append(out[-1])
@@ -37,8 +40,14 @@ def chain(relative: list[np.ndarray | None], gt: list[np.ndarray],
             t = T_est[:3, 3]
             T_edge[:3, 3] = t / np.linalg.norm(t) * np.linalg.norm(T_gt[:3, 3])
         T = T @ np.linalg.inv(T_edge)      # camera->world accumulates the inverse
-        out.append(T[:3, 3].copy())
+        out.append(T.copy())
     return np.array(out)
+
+
+def chain(relative: list[np.ndarray | None], gt: list[np.ndarray],
+          metric: bool) -> np.ndarray:
+    """Fold relative poses into (N+1, 3) world positions. Positions only."""
+    return chain_poses(relative, gt, metric)[:, :3, 3]
 
 
 def path_length(path: np.ndarray) -> float:
@@ -47,8 +56,10 @@ def path_length(path: np.ndarray) -> float:
 
 
 def ate(path: np.ndarray, gt_path: np.ndarray) -> float:
-    """RMS position error against ground truth, metres. No alignment: the
-    poses are metric, so a fitted scale would hide real error.
+    """RMS position error against ground truth, metres, both expressed in
+    the frame of the first pose. No alignment, so this also charges the
+    rotation error of the first edge, times the lever arm: on P000 a 0.23 deg
+    error there is 0.84 m here and 0.15 m after ate_aligned (2026-09-29).
     """
     assert len(path) == len(gt_path)
     sum_e = 0.0
@@ -58,6 +69,27 @@ def ate(path: np.ndarray, gt_path: np.ndarray) -> float:
 
     return np.sqrt(sum_e / (len(path) - 1))
 
+
+
+def ate_aligned(path: np.ndarray, gt_path: np.ndarray) -> float:
+    """
+    RMS position error after the best RIGID alignment of the estimate onto
+    ground truth: rotation and translation, no scale. Removes only the gauge
+    (which frame the anchor happens to define), never metric error -- a fitted
+    scale would, and is deliberately not fitted. The standard ATE definition.
+    The alignment is the same Kabsch fit the frontend uses on point clouds.
+    """
+    T = rigid_alignment(path, gt_path)
+    aligned = path @ T[:3, :3].T + T[:3, 3]
+    return float(np.sqrt(((aligned - gt_path) ** 2).sum(axis=1).mean()))
+
+
+def rigid_alignment(path: np.ndarray, gt_path: np.ndarray) -> np.ndarray:
+    """The (4, 4) ate_aligned fits: gt ~ R path + t. Separate so the viewers
+    can draw an estimate the way ate_aligned scores it."""
+    assert len(path) == len(gt_path)
+    return cpp.kabsch_algorithm(np.asarray(path, dtype=np.float64),
+                                np.asarray(gt_path, dtype=np.float64)).T_ji.matrix()
 
 
 def drift(path: np.ndarray, gt_path: np.ndarray) -> tuple[float, float]:

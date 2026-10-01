@@ -51,3 +51,9 @@ Callers do camera.project(T_CW * P_W) to project a world-frame point.
 
 Distortion:
 not modeled — assumes undistorted intrinsics (e.g. TartanAir renders).
+
+Other camera conventions are converted at the frame source and never leak above it:
+TartanAir poses are NED (T_WC @ T_ned_cv, data_utils/dataset.py).
+Habitat cameras are +X right, +Y up, looking down -Z (T_WC @ T_hab_cv, a flip
+of Y and Z, data_utils/hm3d_sequence.py). Habitat depth is planar, so it is
+OpenCV Z unchanged.

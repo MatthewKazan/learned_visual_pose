@@ -40,6 +40,7 @@ PYBIND11_MODULE(_geometry, m) {
     .def("log", &RotationSO3::log)
     .def("matrix", &RotationSO3::matrix)
     .def("inverse", &RotationSO3::inverse)
+    .def("magnitude", &RotationSO3::magnitude)
     .def("__mul__", py::overload_cast<const RotationSO3&>(&RotationSO3::operator*, py::const_))
     .def("__mul__", py::overload_cast<const Eigen::Vector3d&>(&RotationSO3::operator*, py::const_))
     .def("__repr__", [](const RotationSO3& R) {
@@ -114,7 +115,8 @@ PYBIND11_MODULE(_geometry, m) {
       .def("save_to_file", &pose_graph::FactorGraph::save_to_file,
            py::arg("path_to_g2o_file"))
       .def("gauss_newton", &pose_graph::FactorGraph::gauss_newton,
-           py::arg("iter_threshold") = 1e-6f, py::arg("verbose") = false, py::arg("huber") = false)
+           py::arg("iter_threshold") = 1e-6, py::arg("verbose") = false, py::arg("huber") = 0.0,
+           py::arg("lm_lambda_init") = 0.0)
       // (N, 4, 4) of the current estimates -- what the caller wants back after
       // gauss_newton, without walking `vertices` element by element in Python
       .def("poses", [](const pose_graph::FactorGraph &g) {

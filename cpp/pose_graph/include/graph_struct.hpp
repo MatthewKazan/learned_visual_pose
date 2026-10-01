@@ -62,7 +62,7 @@ namespace pose_graph {
     /// @param verbose print cost, |delta| and iteration count -- a wrong
     ///                Jacobian shows up as a cost that rises or stalls, which
     ///                is invisible from the outside.
-    void gauss_newton(double iter_threshold = 1e-6, bool verbose = false, double huber = 0.0);
+    void gauss_newton(double iter_threshold = 1e-6, bool verbose = false, double huber = 0.0, double lm_lambda_init = 0.0);
 
 
   };
