@@ -31,6 +31,8 @@ class KeyFrame:
     global_descriptor: np.ndarray  # (D,) pooled fingerprint, for loop candidates
 
 
+
+
 # Returns the fit, not just the pose, so the weight uses the same samples.
 RelativePoseFn = Callable[[np.ndarray, np.ndarray, Config], cpp.RansacFit | None]
 
@@ -41,7 +43,7 @@ SolveFn = Callable[[cpp.FactorGraph], None]
 
 class WorldModel:
     def __init__(self, descriptor_generator, pooling_method, sequence, cfg: Config,
-                 get_relative_pose: RelativePoseFn, solve: SolveFn):
+                 get_relative_pose: RelativePoseFn):
         self.descriptor_generator = descriptor_generator
         self.pooling_method = pooling_method
         self.factor_graph = cpp.FactorGraph()
@@ -68,7 +70,7 @@ class WorldModel:
         self.camera_model = cpp.PinholeCamera(self.sequence.K)
         self.cfg = cfg
         self.get_relative_pose = get_relative_pose
-        self.solve = solve
+        self.loop_closure_clusters = []
 
     # -- keyframes ----------------------------------------------------------
 
@@ -220,14 +222,14 @@ class WorldModel:
 
     # -- graph --------------------------------------------------------------
 
-    def add_edge(self, seq_idx_i: int, seq_idx_j: int, *, closure: bool = False) -> bool:
+    def add_edge(self, seq_idx_i: int, seq_idx_j: int, *, is_closure: bool = False) -> bool:
         """
         Match a frame pair and add the constraint. False if unusable.
 
-        Odometry (closure=False) extends the chain: i is the anchor, j becomes a
+        Odometry (is_closure=False) extends the chain: i is the anchor, j becomes a
         vertex. It is not refused for few inliers, because that forks the
         trajectory into two gauge anchors; it gets an unknown covariance instead.
-        A closure (closure=True) joins two existing vertices, gated on inlier
+        A closure (is_closure=True) joins two existing vertices, gated on inlier
         count and on the chain-consistency test. A candidate touching a
         keyframe the chain never reached is refused: vertices enter the graph
         through odometry only. Letting candidates add them hung bridged
@@ -236,19 +238,20 @@ class WorldModel:
         the origin (00800 trajectory_01, 2026-09-29).
         """
         known_i, known_j = seq_idx_i in self.vertex_index, seq_idx_j in self.vertex_index
-        if closure and not (known_i and known_j):
+        if is_closure and not (known_i and known_j):
             return False
-        if not closure and (known_j or (not known_i and self.factor_graph.vertices)):
+        if not is_closure and (known_j or (not known_i and self.factor_graph.vertices)):
             return False    # odometry must run anchor -> new frame
-        is_closure = closure
 
         _uv_i, _uv_j, point_i, point_j = self.correspondences(seq_idx_i, seq_idx_j)
         fit = self.get_relative_pose(point_i, point_j, self.cfg)
         if fit is None:
             return False
+        if not is_closure and fit.T_ji.rotation().magnitude() > self.cfg.odometry_max_rotation_rad:
+            return False
 
         # before add_vertex: a late refusal would strand a vertex
-        information = self.edge_information(point_i, point_j, fit)
+        information = self.edge_information(point_i, point_j, fit, is_closure)
         if information is None:
             return False
         # Odometry is not refused for few inliers (see docstring), but its
@@ -296,9 +299,22 @@ class WorldModel:
             self.chain_pos[seq_idx_j] = len(self.chain_prefix)
             self.chain_prefix.append(self.chain_prefix[self.chain_pos[seq_idx_i]]
                                      + self._to_world(seq_idx_j, self.chain_links[-1][2]))
+        else:
+            # Joins the cluster whose SEED (first closure) it is near, not any
+            # member: matching any member chains a whole twice-walked corridor
+            # into one cluster, and 1/size would then gut a long revisit whose
+            # closures constrain different parts of the trajectory.
+            r = self.cfg.loop_closure_range
+            for cluster in self.loop_closure_clusters:
+                i, j = cluster[0]
+                if abs(seq_idx_i - i) < r and abs(seq_idx_j - j) < r:
+                    cluster.append((seq_idx_i, seq_idx_j))
+                    break
+            else:
+                self.loop_closure_clusters.append([(seq_idx_i, seq_idx_j)])
         return True
 
-    # -- closure gates --------------------------------------------------------
+# -- closure gates --------------------------------------------------------
 
     def depth_agreement(self, i: int, j: int, T_ij: np.ndarray, stride: int = 8) -> float:
         """
@@ -389,13 +405,22 @@ class WorldModel:
         vertices = self.factor_graph.vertices
         T_Wi, T_Wj = vertices[self.vertex_index[i]].pose, vertices[self.vertex_index[j]].pose
         r = np.asarray((T_Wi * cpp.PoseSE3(Z_ij) * T_Wj.inverse()).log()).ravel()
+        if np.linalg.norm(r[3:]) > self.cfg.max_residual_threshold:
+            return False
+        # A fit that collapses the baseline: measured translation a small
+        # fraction of what the chain says, over a chain span long enough that
+        # drift cannot explain it. See Config.closure_collapse_ratio.
+        t_chain = np.linalg.norm(np.asarray((T_Wi.inverse() * T_Wj).translation()))
+        t_meas = np.linalg.norm(np.asarray(Z_ij)[:3, 3])
+        if t_chain > self.cfg.closure_collapse_min_m and t_meas < self.cfg.closure_collapse_ratio * t_chain:
+            return False
         lo, hi = sorted((self.chain_pos[i], self.chain_pos[j]))
         covariance = (self.chain_prefix[hi] - self.chain_prefix[lo]
                       + self._to_world(j, np.linalg.inv(information)))
         d_squared = float(r @ np.linalg.solve(covariance, r))
         return d_squared <= self.cfg.closure_gate_threshold
 
-    def optimize(self) -> np.ndarray | None:
+    def optimize(self, solve: SolveFn) -> np.ndarray | None:
         """
         Calibrate the weights, solve, return (N, 3) positions.
 
@@ -404,7 +429,7 @@ class WorldModel:
         if len(self.factor_graph.vertices) < 2:
             return None
         self.calibrate()
-        self.solve(self.factor_graph)
+        solve(self.factor_graph)
         self.rebuild_chain_covariance()
         return np.array(self.factor_graph.poses())[:, :3, 3]
 
@@ -418,21 +443,36 @@ class WorldModel:
         Touches the graph only: the closure gate keeps its own raw copies
         (rebuild_chain_covariance) because this factor is per run.
         """
+        # One revisit's closures are near-copies of one measurement; summed as
+        # independent they over-trust it (00870, 00895). Each member of a
+        # cluster gets 1/size, so the cluster weighs about one closure.
+        # Clusters hold frame numbers, edges hold vertex numbers: they differ
+        # after the first bridged keyframe, so map through vertex_index.
+        info_scale = {}
+        for cluster in self.loop_closure_clusters:
+            for i, j in cluster:
+                vi, vj = self.vertex_index[i], self.vertex_index[j]
+                info_scale[(vi, vj)] = info_scale[(vj, vi)] = 1 / len(cluster)
         edges, vertices = self.factor_graph.edges, self.factor_graph.vertices
         residuals = []
+        info_matrices = []
         for edge in edges:
+            information = edge.info_matrix * info_scale.get((edge.from_index, edge.to_index), 1.0)
             error = (edge.measured_pose.inverse()
                      * vertices[edge.from_index].pose.inverse()
                      * vertices[edge.to_index].pose)
             r = np.asarray(error.log()).ravel()
-            residuals.append(np.sqrt(r @ edge.info_matrix @ r))
+            residuals.append(np.sqrt(r @ information @ r))     # of the graph actually solved
+            info_matrices.append(information)
 
         nonzero = [r for r in residuals if r > 1e-9]
         if not nonzero:
             return
         median = float(np.median(nonzero))
         self.factor_graph.set_information(
-            [edge.info_matrix / median ** 2 for edge in edges])
+            [mat / median ** 2 for mat in info_matrices])
+
+
 
     def measurement(self, fit: cpp.RansacFit) -> np.ndarray:
         """
@@ -454,7 +494,7 @@ class WorldModel:
         T_W_known = self.factor_graph.vertices[self.vertex_index[known]].pose
         return T_W_known.matrix() @ T_known_new
 
-    def edge_information(self, P_i: np.ndarray, P_j: np.ndarray, fit):
+    def edge_information(self, P_i: np.ndarray, P_j: np.ndarray, fit, loop_closure: bool):
         """
         (6, 6) POSE information for one edge, or None if the fit cannot estimate its
         own error.
@@ -484,6 +524,16 @@ class WorldModel:
             return np.eye(6) * (self.cfg.edge_effective_inliers / variance)
 
         covariance = residual.T @ residual / (len(residual) - 2)
+        eigvals = np.linalg.eigvalsh(covariance)
+        if loop_closure and np.max(eigvals) / np.min(eigvals) > self.cfg.info_ratio_threshold:
+            return None
+        # Floor each principal variance: inlier residuals on a plane put sigma
+        # 0.001-0.007 mm on its normal, against 0.14-1.7 mm (p5) on true pairs,
+        # and inverting that gave one edge 99% of a graph's cost. See
+        # Config.point_sigma_floor_m.
+        # TODO: UNDERSTAND THIS
+        w, basis = np.linalg.eigh(covariance)
+        covariance = (basis * np.maximum(w, self.cfg.point_sigma_floor_m ** 2)) @ basis.T
         try:
             point_information = np.linalg.inv(covariance)
         except np.linalg.LinAlgError:

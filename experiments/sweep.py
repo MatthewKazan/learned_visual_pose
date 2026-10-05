@@ -23,7 +23,8 @@ to compare fairly.
 """
 import argparse
 import sys
-from dataclasses import replace
+from dataclasses import asdict, replace
+from functools import partial
 
 import optuna
 from optuna.trial import create_trial
@@ -33,8 +34,8 @@ from torch.utils.data import DataLoader, Subset
 from visual_pose.config import Config
 from visual_pose.data_utils.constants import DEVICE, REPO_DIR
 from visual_pose.models.descriptor_cnn import DescriptorCNN
-from visual_pose.training import (train_val_model, set_up_loss_optimizer_lr_scheduler,
-                                         test_model, mma)
+from visual_pose.training import fit
+from visual_pose.training_CNN import cnn_evaluate, cnn_step
 
 # Cheap stand-in for the real problem.
 # P000 (bright indoor hospital) + P006 (dark japanese alley) keeps the
@@ -429,12 +430,6 @@ def run_one(base: Config, overrides: dict, label: str, trial=None) -> float:
         norm=cfg.norm,
     ).to(DEVICE)
 
-    loss_fn, optimizer, lr_scheduler = set_up_loss_optimizer_lr_scheduler(
-        model=model, learning_rate=cfg.learning_rate, momentum=cfg.momentum,
-        num_epochs=cfg.num_epochs, weight_decay=cfg.weight_decay,
-        min_lr_factor=cfg.min_lr_factor, optimizer=cfg.optimizer,
-        temperature=cfg.temperature)
-
     best = [0.0]
 
     def on_epoch_end(epoch, val_mma):
@@ -444,10 +439,11 @@ def run_one(base: Config, overrides: dict, label: str, trial=None) -> float:
             if trial.should_prune():
                 raise optuna.TrialPruned()
 
-    train_val_model(model, train_loader, val_loader, loss_fn, optimizer, lr_scheduler,
-                    num_epochs=cfg.num_epochs, print_freq=cfg.print_freq,
-                    checkpoint_dir=cfg.checkpoint_dir, checkpoint_tau=cfg.checkpoint_tau,
-                    on_epoch_end=on_epoch_end, eval_every=EVAL_EVERY)
+    fit(model, train_loader, val_loader,
+        step=partial(cnn_step, temperature=cfg.temperature),
+        evaluate=partial(cnn_evaluate, tau=cfg.checkpoint_tau),
+        settings=replace(cfg.train_settings(), eval_every=EVAL_EVERY),
+        metric_name=f"val MMA@{cfg.checkpoint_tau}", config=asdict(cfg), on_epoch_end=on_epoch_end)
     return best[0]
 
 

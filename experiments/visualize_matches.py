@@ -33,11 +33,11 @@ import numpy as np
 import torch
 from torch.nn import functional as F
 
-from visual_pose.checkpoints import load_model
+from visual_pose.checkpoints import load_cnn_model
 from visual_pose.config import Config
 from visual_pose.data_utils.constants import DEVICE, REPO_DIR
 from visual_pose.data_utils.dataset import TartanAirSequence
-from visual_pose.data_utils.training_dataset import TACorrespondenceDataset
+from visual_pose.data_utils.training_dataset_CNN import TACorrespondenceDataset
 from visual_pose.geometry.best_match import best_match
 from visual_pose.matching import descriptors_at, mma
 from visual_pose.models.descriptor_cnn import DescriptorCNN
@@ -219,7 +219,7 @@ def main():
     builders = {
         "SIFT": lambda: SIFT(step=cfg.sample_step),
         "untrained": lambda: DescriptorCNN.from_config(cfg).to(DEVICE).eval(),
-        "trained": lambda: load_model(cfg, args.checkpoint).eval(),
+        "trained": lambda: load_cnn_model(cfg, args.checkpoint).eval(),
     }
     models = {}
     for name in [n.strip() for n in args.models.split(",")]:

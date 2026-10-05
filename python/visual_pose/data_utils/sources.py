@@ -7,6 +7,8 @@ other than sequence()), and put it in SOURCES before TartanAirSource.
 """
 from __future__ import annotations
 
+import os
+import shutil
 from pathlib import Path
 
 import cv2
@@ -15,7 +17,14 @@ import numpy as np
 from visual_pose.data_utils.bag_sequence import BAGS, read_bag
 from visual_pose.data_utils.constants import REPO_DIR
 from visual_pose.data_utils.dataset import FrameSequence, TartanAirSequence
-from visual_pose.data_utils.hm3d_sequence import HM3D, POSES_FILE, T_hab_cv, load_poses, trajectory_dirs
+from visual_pose.data_utils.hm3d_sequence import POSES_FILE, T_hab_cv, load_poses, scene_dir, trajectory_dirs
+
+
+# Write-through SSD cache of HM3D rgb/ and depth/ files, filled on first read.
+# HM3D sits on a USB disk: 33 ms a cold JPEG, ~15-20 MB/s, which made one
+# training epoch disk-bound at ~1 h (2026-10-01); from the SSD a frame is ~1.6 ms.
+# Full size ~21 GB rgb + ~43 GB depth. Delete the folder to drop it; it refills.
+FRAME_CACHE = REPO_DIR / "data" / "cache" / "hm3d_frames"
 
 
 class Source:
@@ -51,7 +60,7 @@ class HM3DSource(Source):
     def __init__(self, key: str):
         super().__init__(key)
         scene, trajectory = self.name.split("/")
-        self.dir = HM3D / scene / "trajectories" / trajectory
+        self.dir = scene_dir(scene) / "trajectories" / trajectory
 
     @classmethod
     def discover(cls) -> list[str]:
@@ -79,17 +88,30 @@ class SavedHM3DFrames(FrameSequence):
     def __init__(self, traj_dir: Path):
         from visual_pose.data_utils.hm3d_sequence import HFOV_DEG, IMAGE_SIZE, intrinsics_from_hfov
         self.dir = traj_dir
+        self.cache_dir = FRAME_CACHE / traj_dir.parents[1].name / "trajectories" / traj_dir.name
         self.poses = load_poses(traj_dir / POSES_FILE) @ T_hab_cv
         self.K = intrinsics_from_hfov(HFOV_DEG, *IMAGE_SIZE)
 
     def __len__(self) -> int:
         return len(self.poses)
 
+    def _cached(self, sub: str, name: str) -> str:
+        """Path to read: the SSD copy, copied byte for byte from the USB original on first read."""
+        local = self.cache_dir / sub / name
+        if not local.exists():
+            local.parent.mkdir(parents=True, exist_ok=True)
+            # via a per-process temp name: loader workers can miss the same file at once,
+            # and the rename is atomic, so nobody reads a half-written copy
+            tmp = local.with_name(f".{name}.{os.getpid()}")
+            shutil.copyfile(self.dir / sub / name, tmp)
+            tmp.replace(local)
+        return str(local)
+
     def rgb(self, i: int) -> np.ndarray:
-        return cv2.cvtColor(cv2.imread(str(self.dir / "rgb" / f"{i:06d}.jpg")), cv2.COLOR_BGR2RGB)
+        return cv2.cvtColor(cv2.imread(self._cached("rgb", f"{i:06d}.jpg")), cv2.COLOR_BGR2RGB)
 
     def depth(self, i: int) -> np.ndarray:
-        return cv2.imread(str(self.dir / "depth" / f"{i:06d}.png"), cv2.IMREAD_UNCHANGED).astype(np.float32) / 1000
+        return cv2.imread(self._cached("depth", f"{i:06d}.png"), cv2.IMREAD_UNCHANGED).astype(np.float32) / 1000
 
     def pose(self, i: int) -> np.ndarray:
         return self.poses[i]

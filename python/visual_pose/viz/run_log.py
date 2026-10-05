@@ -141,6 +141,12 @@ class RunWriter:
         self._write(kind="poses", track=track, frames=[int(f) for f in frames],
                     poses=np.round(np.asarray(poses, float), 6).tolist())
 
+    def closures(self, track: str, pairs, T_ji=None) -> None:
+        """Verified loop closures as sequence frame pairs (the frames of `poses`),
+        and optionally each closure's measured T_ji."""
+        self._write(kind="closures", track=track, pairs=np.asarray(pairs, int).reshape(-1, 2).tolist(),
+                    T_ji=None if T_ji is None else np.round(np.asarray(T_ji, float), 6).tolist())
+
     def summary(self, track: str, text: str) -> None:
         """A one-line result the viewer appends to the track's legend entry."""
         self._write(kind="summary", track=track, text=text)
@@ -250,6 +256,8 @@ class Prediction:
     # frame of each pose, and T_0k with rotation (the 3D map needs it)
     frames: np.ndarray | None = None
     poses: np.ndarray | None = None
+    closures: np.ndarray | None = None    # (C, 2) frame pairs; a graph twin shares its parent's
+    closure_T_ji: np.ndarray | None = None  # (C, 4, 4) measured, when logged
 
 
 @dataclass
@@ -273,7 +281,7 @@ def read_run_log(path: Path) -> RunEntry:
                 pass              # a run still writing its last line
     meta = records[0]
     scene = meta.get("name", "")
-    last, hints, ate, full, noted = {}, {}, {}, {}, None
+    last, hints, ate, full, noted, closures = {}, {}, {}, {}, None, {}
     reference = np.zeros((0, 3))
     for r in records:
         kind = r.get("kind")
@@ -285,6 +293,9 @@ def read_run_log(path: Path) -> RunEntry:
             ate[r["track"]] = r["text"]
         elif kind == "poses":
             full[r["track"]] = (np.array(r["frames"]), np.array(r["poses"], float))
+        elif kind == "closures":
+            closures[r["track"]] = (np.array(r["pairs"], int).reshape(-1, 2),
+                                    None if r.get("T_ji") is None else np.array(r["T_ji"], float))
         elif kind == "reference" and not len(reference):
             reference = np.array(r["positions"], float)
         elif kind == "note":
@@ -303,7 +314,8 @@ def read_run_log(path: Path) -> RunEntry:
             text = f"ATE {noted[1 if parent else 0]} m"
         predictions.append(Prediction(path, track, name, bool(parent),
                                       np.array(positions, float), text,
-                                      *full.get(track, (None, None))))
+                                      *full.get(track, (None, None)),
+                                      *closures.get(track, closures.get(parent, (None, None)))))
     stamp = path.name[:15]    # RunWriter names files YYYYmmdd-HHMMSS_...
     return RunEntry(
         log=path, when=f"{stamp[4:6]}-{stamp[6:8]} {stamp[9:11]}:{stamp[11:13]}",

@@ -72,6 +72,11 @@ namespace geometry {
     return Ad;
   }
 
+  Jacobian PoseSE3::right_jacobian() const {
+    //TODO: FIGURE THIS OUT
+    return Jacobian::Identity();
+  }
+
   PoseSE3 PoseSE3::operator*(const PoseSE3& other) const {
     return PoseSE3(R_ * other.R_, R_ * other.t_ + t_);
   }

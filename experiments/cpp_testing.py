@@ -17,7 +17,7 @@ import numpy as np
 import torch
 
 from visual_pose import _geometry as cpp
-from visual_pose.checkpoints import load_model
+from visual_pose.checkpoints import load_cnn_model
 from visual_pose.config import Config
 from visual_pose.data_utils.constants import DEVICE, INTRINSICS_TARTAN_AIR, REPO_DIR
 from visual_pose.data_utils.dataset import TartanAirSequence
@@ -329,7 +329,7 @@ def main():
     cpp.set_seed(0)         # RANSAC is randomized; pin it or the numbers wander
     cfg.run_name = "fine_tuning_wide_baseline"
     seq = TartanAirSequence(REPO_DIR / "data" / "tartan_air" / "P002")
-    model = load_model(cfg).eval()
+    model = load_cnn_model(cfg).eval()
 
     frames = list(range(0, len(seq), GAP))
     print(f"{cfg.val_sequence}: {len(frames) - 1} edges, gap {GAP}, "

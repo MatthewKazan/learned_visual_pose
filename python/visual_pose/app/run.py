@@ -14,30 +14,27 @@ from __future__ import annotations
 
 import time
 import traceback
-from dataclasses import dataclass, field, fields, replace
+from dataclasses import dataclass, fields, replace
 from enum import StrEnum
 from functools import partial
-from typing import Callable
 
 import numpy as np
 import torch
 
 from visual_pose import _geometry as cpp
-from visual_pose.checkpoints import load_model
+from visual_pose.checkpoints import LearnedPooling, load_cnn_model
 from visual_pose.config import Config
-from visual_pose.data_utils.hm3d_sequence import HM3D, POSES_FILE
+from visual_pose.data_utils.constants import HM3D_ROOTS
+from visual_pose.data_utils.hm3d_sequence import POSES_FILE, scene_dirs
 from visual_pose.data_utils.sources import source
 from visual_pose.evaluation import metrics
-from visual_pose.geometry import relative_pose
 from visual_pose.models.global_descriptor import avg_pooling, gem_pooling
-from visual_pose.pose_graph.world_model import WorldModel
+# The frontend itself (edge solvers, the edge/closure loop) lives in
+# pose_graph/frontend.py so the HM3D generator can run it headless; this
+# module adds the graph solvers, the viewer and the metrics.
+from visual_pose.pose_graph import frontend
+from visual_pose.pose_graph.frontend import EdgeSolver, keyframes, solver_name
 from visual_pose.viz.run_log import DEFAULT_ROOT, RunWriter
-
-
-class EdgeSolver(StrEnum):
-    """Relative pose from one frame pair."""
-    EIGHT_POINT = "eight point"
-    KABSCH = "kabsch"
 
 
 class GraphSolver(StrEnum):
@@ -47,37 +44,14 @@ class GraphSolver(StrEnum):
     # TRANSFORMER = "transformer"     # Phase 3: add one entry to GRAPH_SOLVERS
 
 
-# Not frozen: Config is not either, so a generated __hash__ would raise.
 @dataclass
-class Variant:
-    """Which solvers to run, and the Config to run them with."""
-    edge_solver: EdgeSolver = EdgeSolver.KABSCH
-    ransac: bool = True                    # which robust estimator, not a wrapper
+class Variant(frontend.Variant):
+    """The frontend's Variant plus which graph solver runs on its output."""
     graph_solver: GraphSolver = GraphSolver.NONE
-    config: Config = field(default_factory=Config)
-    pooling_fn: Callable[[torch.Tensor], torch.Tensor] = gem_pooling
-
-    @property
-    def metric(self) -> bool:
-        """t in metres? A direction-only t cannot feed a graph solver."""
-        return self.edge_solver in METRIC
 
     @property
     def wants_graph(self) -> bool:
         return self.graph_solver is not GraphSolver.NONE
-
-    @property
-    def edge_function(self):
-        """(P_i, P_j, cfg) -> RansacFit | None, for (edge_solver, ransac)."""
-        try:
-            return EDGE_SOLVERS[(self.edge_solver, self.ransac)]
-        except KeyError:
-            raise SystemExit(
-                f"no estimator for edge_solver={self.edge_solver!s}, "
-                f"ransac={self.ransac}\n"
-                f"  have: {sorted((str(s), r) for s, r in EDGE_SOLVERS)}\n"
-                "  see geometry/relative_pose.py -- then one line in EDGE_SOLVERS"
-            ) from None
 
     @property
     def graph_function(self):
@@ -92,7 +66,7 @@ class Variant:
 
     def check(self) -> None:
         """Fail at import, not at edge 40 of a long run."""
-        _ = self.edge_function
+        super().check()
         if self.wants_graph:
             _ = self.graph_function
         if self.wants_graph and not self.metric:
@@ -137,10 +111,11 @@ def hm3d(scene: str = "*", trajectory: str = "trajectory_*") -> list[str]:
         hm3d("00801-*", "trajectory_2[0-5]")
     """
     keys = [f"hm3d:{path.parent.parent.parent.name}/{path.parent.name}"
-            for path in sorted(HM3D.glob(f"{scene}/trajectories/{trajectory}/{POSES_FILE}"))]
+            for d in scene_dirs() if d.match(scene)
+            for path in sorted(d.glob(f"trajectories/{trajectory}/{POSES_FILE}"))]
     if not keys:
         # Or a typo'd glob quietly runs nothing.
-        raise SystemExit(f"no HM3D trajectories match {scene}/{trajectory} under {HM3D}")
+        raise SystemExit(f"no HM3D trajectories match {scene}/{trajectory} under {HM3D_ROOTS}")
     return keys
 
 
@@ -149,7 +124,7 @@ def hm3d(scene: str = "*", trajectory: str = "trajectory_*") -> list[str]:
 # What everything below starts from. Anything not named here keeps Config's
 # default, and labels name whatever differs.
 BASE = Config(
-    run_name="fine_tuning_wide_baseline",     # which descriptor weights
+    run_name="fine_tuning_wide_baseline_2",     # which descriptor weights
     max_depth=100.0,              # 30 is the TRAINING filter; evaluation has
                                   # always run at 100 (TartanAir gives ~1e4 for sky)
     max_edges=None,                 # None = the whole sequence
@@ -170,9 +145,25 @@ BASE = Config(
     loop_span_bands=8,
 )
 
+# Loop-closure fingerprint: gem_pooling, or a trained AttentionPooling run
+# (checkpoints/<run>). A learned one is trained on ONE descriptor's backbone:
+# the _ft2 runs are on fine_tuning_wide_baseline_2; retrain on a new descriptor.
+# 20 held-out trajectories, candidates true / graph ATE mean / median:
+#   infonce_t02_h8_ft2_e16 63.6% 0.056 0.040   (16 epochs, best at 11)
+#   infonce_t02_h8_ft2     62.5% 0.058 0.050   (8 epochs)
+#   sigmoid_ft2            52.8% 0.063 0.038
+#   GeM                    53.4% 0.062 0.034
+ATTENTION_POOLING = LearnedPooling("attention_pooling_infonce_t02_h8_ft2_e16")
+# The learned cosines sit ~0.6-0.8, so GeM's 0.94 retrieval threshold would
+# cut its pool to a few dozen pairs (71 of 500 on 00800); -1 admits every pair
+# and lets loop_selection rank them, as 0.94 effectively does for GeM.
+ATTENTION_CONFIG = replace(BASE, loop_retrieval_similarity=-1.0, note="attention")
+
 COMMON = [
     Variant(EdgeSolver.KABSCH, ransac=True,
-            graph_solver=GraphSolver.GAUSS_NEWTON, config=BASE, pooling_fn=gem_pooling),
+            graph_solver=GraphSolver.GAUSS_NEWTON, config=ATTENTION_CONFIG, pooling_fn=ATTENTION_POOLING),
+    # Variant(EdgeSolver.KABSCH, ransac=True,
+    #         graph_solver=GraphSolver.GAUSS_NEWTON, config=BASE, pooling_fn=gem_pooling),
     # Variant(EdgeSolver.KABSCH, ransac=False, config=BASE, graph_solver=GraphSolver.GAUSS_NEWTON),
     # Variant(EdgeSolver.KABSCH, ransac=False, config=BASE),
     # Variant(EdgeSolver.EIGHT_POINT, ransac=False, config=BASE),
@@ -187,22 +178,27 @@ RUNS = {
     # wall-aliasing cases (old trajectory_20 and _23, 00801) are gone with
     # the old data; the gates built on them stay.
     # Everything on disk. Comment out, and uncomment below, to pick by hand.
-    # **dict.fromkeys(hm3d(), COMMON),
+    **dict.fromkeys(hm3d(), COMMON),
 
     # iPhone LiDAR rosbag (EECE5550): depth only, normal image in place of RGB,
     # no ground truth. Key: bag:<directory under BAGS>. 216 frames at 4 Hz.
     "bag:inputs_20250410_203244": COMMON,
-    # **dict.fromkeys(hm3d("00803-*"), COMMON),               # one scene
+    # **dict.fromkeys(hm3d("0080*"), COMMON),               # one scene
+    # **dict.fromkeys(hm3d("0081*"), COMMON),  # one scene
+    # **dict.fromkeys(hm3d("0082*"), COMMON),  # one scene
+
+    # **dict.fromkeys(hm3d("00853-*"), COMMON),  # one scene
+
     # "hm3d:00801-HaxA7YrQdEC/trajectory_00": COMMON,         # named ones
     # "hm3d:00800-TEEsavR23oF/trajectory_01": COMMON,
 
-    # "P006": COMMON,
-    # "P005": COMMON,
-    # "P004": COMMON,
-    # "P003": COMMON,
-    # "P002": COMMON,
-    # "P001": COMMON,
-    # "P000": COMMON,
+    "P006": COMMON,
+    "P005": COMMON,
+    "P004": COMMON,
+    "P003": COMMON,
+    "P002": COMMON,
+    "P001": COMMON,
+    "P000": COMMON,
 
     # ---- sweeps run 2026-09-09, P006 unless noted ---------------------------
     # selection policy, everything else at BASE:
@@ -247,20 +243,9 @@ GRAPH_LINESTYLE = "--"
 
 # ===========================================================================
 
-# (edge_solver, ransac) -> (P_i, P_j, cfg) -> RansacFit | None
-EDGE_SOLVERS = {
-    (EdgeSolver.KABSCH, False): relative_pose.kabsch,
-    (EdgeSolver.KABSCH, True): relative_pose.kabsch_ransac,
-    (EdgeSolver.EIGHT_POINT, False): relative_pose.eight_point,
-    # (EdgeSolver.EIGHT_POINT, True): relative_pose.eight_point_ransac,
-}
-
-# Whose t is in metres. Decides the |t| column, whether chaining borrows a
-# scale, and whether a graph built from them means anything.
-METRIC = {EdgeSolver.KABSCH}
-
 # graph_solver -> (config) -> SolveFn. The C++ method already matches the
-# contract, so no wrapper. The transformer goes here.
+# contract, so no wrapper. The transformer goes here. Edge solvers:
+# frontend.EDGE_SOLVERS.
 GRAPH_SOLVERS = {
     GraphSolver.GAUSS_NEWTON: lambda config: partial(
         cpp.FactorGraph.gauss_newton, iter_threshold=SOLVER_TOLERANCE,
@@ -299,10 +284,6 @@ if not EVERY:
 BASELINE = Config()
 VARIES = {name: len({getattr(v.config, name) for v in EVERY}) > 1
           for name in DESCRIBE}
-
-
-def solver_name(variant: Variant) -> str:
-    return str(variant.edge_solver) + (" + ransac" if variant.ransac else "")
 
 
 def described(config: Config, names) -> list[str]:
@@ -350,10 +331,17 @@ def edge_truth(sequence, pairs: list[tuple[int, int]]) -> list[np.ndarray]:
     return [np.linalg.inv(sequence.pose(j)) @ sequence.pose(i) for i, j in pairs]
 
 
-def keyframes(sequence, gap: int, max_edges: int | None) -> list[int]:
-    stop = len(sequence) if max_edges is None else min(len(sequence),
-                                                       (max_edges + 1) * gap)
-    return list(range(0, stop, gap))
+def stage(name: str, call):
+    """Run one stage, printing the stub that gates it rather than raising."""
+    try:
+        return call(), None
+    except NotImplementedError as e:
+        print(f"    {name:22s} BLOCKED  {e}")
+    except Exception as e:
+        tb = traceback.extract_tb(e.__traceback__)[-1]
+        where = tb.filename.split("visual_pose/")[-1]
+        print(f"    {name:22s} ERROR    {type(e).__name__}: {e}  [{where}:{tb.lineno}]")
+    return None, "failed"
 
 
 def animate_solve(world, run, track: str, *, huber: float, lm_lambda_init: float) -> None:
@@ -383,107 +371,56 @@ def animate_solve(world, run, track: str, *, huber: float, lm_lambda_init: float
         world.rebuild_chain_covariance()    # poses moved; the closure gate's transports go with them
 
 
-def stage(name: str, call):
-    """Run one stage, printing the stub that gates it rather than raising."""
-    try:
-        return call(), None
-    except NotImplementedError as e:
-        print(f"    {name:22s} BLOCKED  {e}")
-    except Exception as e:
-        tb = traceback.extract_tb(e.__traceback__)[-1]
-        where = tb.filename.split("visual_pose/")[-1]
-        print(f"    {name:22s} ERROR    {type(e).__name__}: {e}  [{where}:{tb.lineno}]")
-    return None, "failed"
-
-
 @torch.no_grad()
 def run_variant(variant: Variant, scene: str, sequence, model, run) -> dict[str, float]:
     """One variant, writing tracks into the scene's shared run log. Returns
     track label -> ATE, for the summary."""
     cfg = variant.config
-    # gap 2 on 0.6 m / 13.5 deg HM3D frames put keyframes 1.2 m and 27 deg
-    # apart and bridged up to 117 of them (2026-09-30); such data is already at
-    # keyframe spacing, so the gap applies to video-rate sequences only
-    frames = keyframes(sequence, 1 if sequence.frames_are_keyframes else cfg.val_frame_gap, cfg.max_edges)
+    front = frontend_label(variant, scene)
+    print(f"  {front}")
+    run.declare_track(front, show_edges=True)
+
+    built = frontend.build(variant, sequence, model, on_edge=lambda f: run.frame(
+        metrics.chain(f.estimates, edge_truth(sequence, f.pairs), metric=variant.metric),
+        track=front, x=len(f.pairs), x_label="edge"))
+    world, frames, pairs, estimates = built.world, built.frames, built.pairs, built.estimates
+    candidates, closures, closure_est = built.candidates, built.closures, built.closure_estimates
     nominal = ground_truth(sequence, frames)
     gt_path = metrics.chain(nominal, nominal, metric=True)
 
-    front = frontend_label(variant, scene)
-    print(f"  {front}")
-
-    # the C++ generator is shared, so without this the variants consume each
-    # other's draws and reordering RUNS changes every number
-    cpp.set_seed(cfg.seed)
-
-    world = WorldModel(model, variant.pooling_fn, sequence, cfg,
-                       variant.edge_function, variant.graph_function or (lambda g: None))
-    world.encode_keyframes(frames)      # batched; lazy per-frame encoding costs 2x
-    run.declare_track(front, show_edges=True)
-
-    # One edge at a time so the viewer grows with it. Bridge rather than
-    # refuse: a refused odometry edge leaves its far frame without a vertex and
-    # the trajectory forks into two gauge anchors.
-    estimates: list[np.ndarray] = []
-    pairs: list[tuple[int, int]] = []
-    # Consecutive pairs are known up front, so match them batched. A bridged
-    # keyframe makes the next pair (anchor, j + 2), which is matched singly.
-    world.prefetch_matches(list(zip(frames[:-1], frames[1:])))
-    # TODO: Reanchor after consecutive failures
-    anchor = frames[0]
-    for j in frames[1:]:
-        if not world.add_edge(anchor, j):
-            continue
-        # edges[-1]: add_edge appends, so the new edge is the last one
-        estimates.append(
-            world.factor_graph.edges[-1].measured_pose.inverse().matrix())
-        pairs.append((anchor, j))
-        anchor = j
-        run.frame(metrics.chain(estimates, edge_truth(sequence, pairs),
-                                metric=variant.metric),
-                  track=front, x=len(estimates), x_label="edge")
     bridged = len(frames) - 1 - len(estimates)
     print(f"    {'odometry edges':22s} {len(estimates)}/{len(frames) - 1} added"
           + (f", {bridged} keyframe(s) bridged" if bridged else ""))
     gt = edge_truth(sequence, pairs)
 
-    candidates, _ = stage("loop candidates", lambda: world.loop_candidates(frames))
-    if candidates is not None:
-        world.prefetch_matches(candidates)
-        closures: list[tuple[int, int]] = []
-        closure_est: list[np.ndarray] = []
-        for i, j in candidates:
-            if not world.add_edge(i, j, closure=True):
-                continue
-            closure_est.append(
-                world.factor_graph.edges[-1].measured_pose.inverse().matrix())
-            closures.append((i, j))
-        print(f"    {'loop closures':22s} {len(closures)}/{len(candidates)} verified")
-        run.note(f"{len(closures)}/{len(candidates)} loop closures verified")
+    print(f"    {'loop closures':22s} {len(closures)}/{len(candidates)} verified")
+    run.note(f"{len(closures)}/{len(candidates)} loop closures verified")
+    run.closures(front, closures, closure_est)
 
-        if closures and sequence.has_ground_truth:
-            # p95 as well as p50: a false closure at wide baseline still scores a
-            # high inlier count, so it survives verification and hides in the tail
-            # rather than moving the median.
-            ce = np.array([metrics.pose_error(T, T_gt) for T, T_gt
-                           in zip(closure_est, edge_truth(sequence, closures))])
-            for tag, q in (("p50", 50), ("p95", 95)):
-                rot, direction, magnitude = np.nanpercentile(ce, q, axis=0)
-                print(f"    {'closure err ' + tag:22s} rot {rot:.2f} deg, "
-                      f"dir {direction:.2f} deg, |t| {magnitude:.2f} cm")
-            run.note(f"closure rot err p50 {np.nanmedian(ce[:, 0]):.2f} deg, "
-                     f"p95 {np.nanpercentile(ce[:, 0], 95):.2f} deg")
+    if closures and sequence.has_ground_truth:
+        # p95 as well as p50: a false closure at wide baseline still scores a
+        # high inlier count, so it survives verification and hides in the tail
+        # rather than moving the median.
+        ce = np.array([metrics.pose_error(T, T_gt) for T, T_gt
+                       in zip(closure_est, edge_truth(sequence, closures))])
+        for tag, q in (("p50", 50), ("p95", 95)):
+            rot, direction, magnitude = np.nanpercentile(ce, q, axis=0)
+            print(f"    {'closure err ' + tag:22s} rot {rot:.2f} deg, "
+                  f"dir {direction:.2f} deg, |t| {magnitude:.2f} cm")
+        run.note(f"closure rot err p50 {np.nanmedian(ce[:, 0]):.2f} deg, "
+                 f"p95 {np.nanpercentile(ce[:, 0], 95):.2f} deg")
 
-            # Span in KEYFRAMES, the unit loop_min_gap is expressed in. A
-            # closure only corrects drift if it spans enough of the chain for
-            # error to have accumulated between its endpoints; spans piled up
-            # at the minimum gap add cycles that were never in tension.
-            at = {f: k for k, f in enumerate(frames)}
-            spans = np.array([abs(at[j] - at[i]) for i, j in closures])
-            print(f"    {'closure span (kf)':22s} min {spans.min()}, "
-                  f"p50 {int(np.median(spans))}, max {spans.max()}"
-                  f"  (chain is {len(frames) - 1} kf, gap {cfg.loop_min_gap})")
-            run.note(f"closure span kf min {spans.min()} "
-                     f"p50 {int(np.median(spans))} max {spans.max()}")
+        # Span in KEYFRAMES, the unit loop_min_gap is expressed in. A
+        # closure only corrects drift if it spans enough of the chain for
+        # error to have accumulated between its endpoints; spans piled up
+        # at the minimum gap add cycles that were never in tension.
+        at = {f: k for k, f in enumerate(frames)}
+        spans = np.array([abs(at[j] - at[i]) for i, j in closures])
+        print(f"    {'closure span (kf)':22s} min {spans.min()}, "
+              f"p50 {int(np.median(spans))}, max {spans.max()}"
+              f"  (chain is {len(frames) - 1} kf, gap {cfg.loop_min_gap})")
+        run.note(f"closure span kf min {spans.min()} "
+                 f"p50 {int(np.median(spans))} max {spans.max()}")
 
     chained = metrics.chain(estimates, gt, metric=variant.metric)
     ates: dict[str, float] = {}
@@ -527,7 +464,7 @@ def run_variant(variant: Variant, scene: str, sequence, model, run) -> dict[str,
             solve = lambda: animate_solve(world, run, track, huber=cfg.huber, lm_lambda_init=0.0)
         else:
             def solve():
-                world.optimize()        # calibrate, solve to SOLVER_TOLERANCE, rebuild the closure gate's chain
+                world.optimize(variant.graph_function)   # calibrate, solve to SOLVER_TOLERANCE, rebuild the closure gate's chain
                 run.frame(np.array(world.factor_graph.poses())[:, :3, 3], track=track, x=1, x_label="iteration")
         _, failed = stage("optimize", solve)
         if not failed:
@@ -619,7 +556,7 @@ def main() -> None:
             for variant in variants:
                 name = variant.config.run_name
                 if name not in models:
-                    loaded = load_model(replace(variant.config, run_name=name)).eval()
+                    loaded = load_cnn_model(replace(variant.config, run_name=name)).eval()
                     loaded.device = next(loaded.parameters()).device
                     models[name] = loaded
                 for track, ate in run_variant(variant, scene, sequence,

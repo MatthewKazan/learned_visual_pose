@@ -6,10 +6,28 @@ Every tunable in one dataclass, with CLI flags generated from its fields.
 Written into each checkpoint, so a result is always traceable to what produced
 it, and a sweep is a command line rather than an edit.
 """
-from dataclasses import dataclass, fields, asdict
+from dataclasses import dataclass, fields, asdict, replace
 from pathlib import Path
 
 from visual_pose.data_utils.constants import REPO_DIR
+
+
+@dataclass
+class TrainSettings:
+    """What training.fit needs, whatever the model. Config.train_settings() builds one for the CNN."""
+    num_epochs: int = 40
+    optimizer: str = "sgd"       # sgd | adamw
+    learning_rate: float = 0.01
+    momentum: float = 0.9        # sgd only
+    weight_decay: float = 1e-4
+    min_lr_factor: float = 0.01  # cosine floor, as a fraction of learning_rate
+    print_freq: int = 50         # batches between loss prints
+    eval_every: int = 1          # epochs between evaluations; the last always runs
+    run_name: str = "default"
+
+    @property
+    def checkpoint_dir(self) -> Path:
+        return REPO_DIR / "checkpoints" / self.run_name
 
 
 @dataclass
@@ -96,6 +114,33 @@ class Config:
     # halves the error (0.62 -> 0.28 deg) at 3.4x fewer matches; past 0.85
     # RANSAC finds no consensus.
     similarity_threshold: float = 0.8
+    odometry_max_rotation_rad = 1.5
+    # Refuse a closure whose inlier residuals are near-planar: largest/smallest
+    # eigenvalue of the point covariance. Inverting one claimed 0.001 mm along
+    # the plane normal, and that single edge carried 99% of the graph's cost
+    # (00820, 00875). 10 HM3D graphs, 2026-10-02: odometry peaks at 9.4e4; 1e6
+    # refuses 3.1% of closures, including 00875 #447 (1.6e10) and 00820 #429
+    # (8.4e8). Closures only -- refusing an odometry edge forks the chain.
+    info_ratio_threshold: float = 1e6
+    # Refuse a closure before the d^2 test when its rotation disagrees with the
+    # chain by more than this (rad; 1.5 = 86 deg). Across unknown-covariance
+    # odometry the chain covariance is so wide that d^2 passed 94, 96 and 180 deg
+    # closures on 00820 (d^2 9.5-92 < 300). Blind to translation-direction
+    # errors: 00860's 90 deg one has a small rotation.
+    max_residual_threshold: float = 1.5
+    # Refuse a closure whose measured translation is under closure_collapse_ratio
+    # of the chain's prediction, when the chain spans more than closure_collapse_min_m.
+    # The 90 deg "direction" error on 00860 is this: 0.28 m measured against
+    # 7.65 m true. Direction against the chain cannot separate (good closures
+    # span 22 deg p50 to 177 deg, from drift). On the 10 saved HM3D graphs
+    # (2026-10-02) this refuses 4 of 10 bad closures and 0 good ones the
+    # rotation gate does not already refuse (161 good in 00820 are refused by both).
+    closure_collapse_min_m: float = 2.0
+    closure_collapse_ratio: float = 0.2
+    # Lower bound on each principal sigma of an edge's inlier residuals (m).
+    # True pairs sit at 0.14-1.7 mm (p5), the near-planar failures at
+    # 0.001-0.007 mm; 0.1 mm leaves the first untouched and caps the second.
+    point_sigma_floor_m: float = 1e-4
 
     loop_min_gap: int = 50            # keyframes apart to count as a loop
     # absolute count, not the ratio: wrong closures had 3-8 inliers and right
@@ -173,6 +218,50 @@ class Config:
 
     lm_lambda_init: float = 1.0
 
+    # ---- loop-closure aggregator (train.train_atn_pooling) ----
+    # The one definition of a true loop closure, for training and evaluation
+    # alike: either frame sees more than this fraction of its sample grid in
+    # the other. One threshold everywhere: training on 0.3 / 0.05 with the band
+    # dropped, then scoring at 0.1, never showed the model the 0.1-0.3 pairs it
+    # was scored on. 0.25, not 0.1: closer to what verification can match. Not
+    # comparable with runs before 2026-10-02 (GeM span precision on 00800:
+    # 51.8% at 0.1, 39.2% at 0.25).
+    loop_true_overlap: float = 0.15
+    aggregator_frozen_cnn: str = "fine_tuning_wide_baseline_2"   # pooled, and the frontend's matcher; must equal run.py BASE.run_name
+    aggregator_run_name: str = "attention_pooling_infonce_t02_h8_ft2_e16"   # the rest in checkpoints/: earlier runs, kept to compare
+    # AdamW, the usual choice for attention layers, not the CNN's SGD 0.01. Untuned.
+    aggregator_optimizer: str = "adamw"
+    aggregator_learning_rate: float = 1e-4
+    aggregator_num_epochs: int = 16   # val peaked at epoch 11 (63.6%), flat after
+    aggregator_anchors: int = 32          # InfoNCE rows per trajectory step
+    aggregator_hard_negatives: int = 8    # per anchor: its own top-scoring false partners
+    aggregator_temperature: float = 0.02  # with 8 hard negatives: val 63.6% vs GeM 53.4%; 0.07 / 2 plateaued near GeM
+    # Train on every 4th keyframe from a random offset: neighbours are 0.6 m /
+    # 13.5 deg apart and see nearly the same surfaces, and the CNN pass over a
+    # trajectory's frames is most of a step (~11 ms a frame). ~60 frames a step
+    # at 4, so ~10 min an epoch over 800 trajectories. Val keeps every frame.
+    aggregator_frame_stride: int = 4
+    # Trajectories per epoch, a fresh random draw each epoch: 200 of the 800
+    # x ~60 frames is ~12k CNN passes, ~3 min, and every scene recurs within a
+    # few epochs.
+    aggregator_trajectories_per_epoch: int = 200
+    # Optimizer steps per trajectory visit, on its cached CNN maps. 1, not 4:
+    # on 24 trajectories x 400 updates, 4 draws stalled the loss (3.64 -> 3.69)
+    # and ended val span 34.8% against 44.3% with 1 (GeM 40.5%), 2026-10-02.
+    aggregator_draws_per_trajectory: int = 1
+    # "sigmoid": every pair against one learned threshold (aggregator_sigmoid_step);
+    # "infonce": per-anchor rows with self-mined hard negatives (aggregator_step).
+    aggregator_loss: str = "infonce"   # sigmoid: 53.0% val, 9 points below
+    # ColorJitter on training frames. Off: the CNN is frozen, so jitter shifts
+    # its features in training only; same test, val span 38.6% with it, 44.3% without.
+    aggregator_augment: bool = False
+    aggregator_train_probe_scenes: int = 10   # trained-on trajectories scored beside val, to spot memorising
+
+    # Closures whose both endpoints lie within this many keyframes of a
+    # cluster's first closure are one revisit and share one closure's weight
+    # (WorldModel.calibrate). UNTUNED.
+    loop_closure_range: int = 5
+
     @property
     def checkpoint_dir(self) -> Path:
         # per-run directory so runs stop overwriting each other's best.pt
@@ -180,6 +269,16 @@ class Config:
 
     def summary(self) -> str:
         return "\n".join(f"  {k:22} {v}" for k, v in asdict(self).items())
+
+    def train_settings(self) -> TrainSettings:
+        return TrainSettings(**{f.name: getattr(self, f.name) for f in fields(TrainSettings)
+                                if hasattr(self, f.name)})
+
+    def aggregator_train_settings(self) -> TrainSettings:
+        return replace(self.train_settings(), run_name=self.aggregator_run_name,
+                       optimizer=self.aggregator_optimizer,
+                       learning_rate=self.aggregator_learning_rate,
+                       num_epochs=self.aggregator_num_epochs)
 
     def common(self) -> dict:
         return dict(num_correspondences=self.num_correspondences,

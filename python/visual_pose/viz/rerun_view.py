@@ -8,7 +8,7 @@ placed there as
 
 Entities:
     world/truth/{path, ends, camera, cloud/<frame>}, image, depth
-    world/runs/<run>/<track>/<placement>/{path, camera, error_line, cloud/<frame>}
+    world/runs/<run>/<track>/<placement>/{path, closures, closure_error, camera, error_line, cloud/<frame>}
     world/live/<track>, error/<run>/<track>/<placement>, info
 """
 from __future__ import annotations
@@ -31,6 +31,7 @@ IMAGE_SCALE, DEPTH_SCALE, JPEG_QUALITY = 2, 4, 85
 TRUTH_RADIUS, PRED_RADIUS = 0.014, 0.007    # smaller predictions: coinciding clouds hid the truth's colours
 CACHE_DIR = REPO_DIR / "out" / "cache" / "rerun"
 PRED_STALE_M = 0.05      # logged truth this far off the sequence: the data changed since the run
+CLOSURE_COLOR = "#ff00ff"   # not in PRED_COLORS, so a closure never reads as a path
 PRED_COLORS = ("#ff7f0e", "#ffd400", "#2563eb", "#16a34a", "#e11d48", "#7c3aed", "#a16207", "#0f172a")
 SCENE_HIDDEN = ["world/truth/anchors", "world/truth/intermediary"]
 
@@ -73,6 +74,8 @@ def hidden_by_default(entries, has_truth: bool) -> list[str]:
             continue
         twin = any(p.derived for p in e.predictions)
         for p in e.predictions:
+            out += [f"world/runs/{run}/{slug(p.name)}/{pl}/{c}" for pl in ("aligned", "anchored")
+                    for c in ("closures", "closure_error")]
             if has_truth:
                 out += [f"world/runs/{run}/{slug(p.name)}/anchored", f"error/{run}/{slug(p.name)}/anchored"]
             if twin and not p.derived:
@@ -124,6 +127,7 @@ def log_run(rec, seq, T_true, entry, placed: dict, colors: dict) -> None:
         for placement, (points, poses) in placed[pred.track].items():
             base = f"world/runs/{run}/{slug(pred.name)}/{placement}"
             rec.log(f"{base}/path", rr.LineStrips3D([points], colors=[rgb], radii=0.02), static=True)
+            _closures(rec, base, pred, points, poses)
             if poses is None:
                 continue
             _pinhole(rec, f"{base}/camera", rgb, seq.K, seq.depth(0).shape)
@@ -137,12 +141,40 @@ def log_run(rec, seq, T_true, entry, placed: dict, colors: dict) -> None:
                     rec.log(series, rr.Scalars(float(np.linalg.norm(T[:3, 3] - T_true[f, :3, 3]))))
 
 
+def _closures(rec, base: str, pred, points: np.ndarray, poses: np.ndarray | None) -> None:
+    """
+    closures       keyframe i to keyframe j: which keyframes saw the same place.
+                   Not expected to be short: the cameras can be metres apart.
+    closure_error  T_j to T_i T_ij, where the closure's measurement puts j. The
+                   residual's translation, so it is what the graph collapses.
+    Endpoints without a pose (bridged keyframes) are skipped.
+    """
+    import rerun as rr
+    if pred.closures is None or not len(pred.closures) or pred.frames is None or len(pred.frames) != len(points):
+        return
+    at = {int(f): k for k, f in enumerate(pred.frames)}
+    keep = [c for c, (i, j) in enumerate(pred.closures.tolist()) if i in at and j in at]
+    if not keep:
+        return
+    pairs = pred.closures[keep].tolist()
+    labels = [f"{i}-{j}" for i, j in pairs]
+    rec.log(f"{base}/closures", rr.LineStrips3D([[points[at[i]], points[at[j]]] for i, j in pairs],
+                                                colors=[_hex(CLOSURE_COLOR)], radii=0.008,
+                                                labels=labels, show_labels=False), static=True)
+    if poses is None or pred.closure_T_ji is None:
+        return
+    claimed = [(poses[at[i]] @ np.linalg.inv(T_ji))[:3, 3] for (i, _), T_ji in zip(pairs, pred.closure_T_ji[keep])]
+    rec.log(f"{base}/closure_error", rr.LineStrips3D([[points[at[j]], c] for (_, j), c in zip(pairs, claimed)],
+                                                     colors=[_hex(CLOSURE_COLOR)], radii=0.015,
+                                                     labels=labels, show_labels=False), static=True)
+
+
 def log_info(rec, title: str, lines: list[str], entries) -> None:
     import rerun as rr
     rows = ["| run | config | track | ATE |", "|---|---|---|---|"]
     rows += [f"| {e.when} | {e.config} | {p.name} | {p.ate or '-'} |"
              for e in sorted(entries, key=lambda e: e.log.name, reverse=True) for p in e.predictions]
-    text = [f"**{title}**", ""] + lines + ["", "older runs and anchored placements start hidden (eye icons)", ""]
+    text = [f"**{title}**", ""] + lines + ["", "older runs, anchored placements and loop closures start hidden (eye icons)", ""]
     rec.log("info", rr.TextDocument("\n".join(text + (rows if entries else ["no finished runs yet"])),
                                     media_type=rr.MediaType.MARKDOWN), static=True)
 

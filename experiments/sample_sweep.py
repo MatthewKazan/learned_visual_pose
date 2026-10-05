@@ -16,7 +16,7 @@ import numpy as np
 
 from experiments.cpp_testing import GAP, edge, plot
 from visual_pose import _geometry as cpp
-from visual_pose.checkpoints import load_model
+from visual_pose.checkpoints import load_cnn_model
 from visual_pose.config import Config
 from visual_pose.data_utils.constants import REPO_DIR
 from visual_pose.data_utils.dataset import TartanAirSequence
@@ -50,7 +50,7 @@ def main():
     cfg = Config()
     cfg.run_name = "k7_d122_mma70"
     seq = TartanAirSequence(REPO_DIR / "data" / "tartan_air" / cfg.val_sequence)
-    model = load_model(cfg).eval()
+    model = load_cnn_model(cfg).eval()
 
     frames = list(range(0, len(seq), GAP))
     print(f"{cfg.val_sequence}: {len(frames) - 1} edges, gap {GAP}, "

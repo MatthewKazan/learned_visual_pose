@@ -7,13 +7,18 @@ are sent the first time its recording is opened.
     .venv/bin/python -m visual_pose.viz.rerun_app           # leave open
     .venv/bin/python -m visual_pose.viz.rerun_app --follow  # jump to each scene a run finishes in
 
+Enter in its terminal pauses loading new scenes and runs; Enter again resumes where it stopped.
+
 A new data type needs only a Source; per-type extra layers go in EXTRAS.
 """
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
+import select
 import socket
+import sys
 import time
 import zlib
 from collections import deque
@@ -32,6 +37,16 @@ SCAN_S, TAIL_S, ACTIVE_S = 2.0, 0.25, 1.0
 WORK_BUDGET_S = 1.0       # queued work per loop pass, so tails and clicks stay responsive
 RUNS_PER_SCENE = 4        # newest finished runs loaded per scene at startup
 LIVE_WINDOW_S = 600       # an unclosed log modified this recently is live; older ones died
+# Scenes holding frames and maps at once; opening another closes the oldest's recording and
+# re-sends its light layers. Unmeasured: lower it if the viewer still logs "Freeing up data".
+HEAVY_SCENES = 3
+RECONCILE_GRACE_S = 10    # a recording this new may not be in viewer_state yet: not "closed by the viewer"
+
+# ===== EDIT ME: which keys to show. Globs over run.py's RUNS keys; "*" also
+# crosses "/", so "hm3d:00803-*" is every trajectory of that scene.
+SHOW = ["*"]
+# SHOW = ["hm3d:0080*", "hm3d:0081*", "hm3d:0082*", "bag:*"]
+# SHOW = ["hm3d:*/trajectory_0[0-9]"]
 # Source type -> (rec, src, renderer) -> info lines. The renderer is a SceneRenderer
 # for the source's scene, opened only for these.
 EXTRAS = {HM3DSource: view.log_hm3d_extras}
@@ -88,7 +103,8 @@ class Scene:
     colors: dict = field(default_factory=dict)  # (log, track) -> hex
     live: dict = field(default_factory=dict)    # log -> Tail
     extra_lines: list = field(default_factory=list)
-    heavy: bool = False
+    heavy: float = 0.0                          # time frames and maps were sent; 0 = not sent
+    born: float = field(default_factory=time.time)
 
     @property
     def T_true(self):
@@ -109,15 +125,22 @@ class App:
             self.client = ViewerClient.connect(f"rerun+http://127.0.0.1:{port}/proxy")
             self.client.close_recordings("all")        # a restart re-sends everything
         else:
-            self.client = ViewerClient.spawn(port=port, memory_limit=VIEWER_MEMORY, headless=headless,
-                                             hide_welcome_screen=True, executable_path=view.viewer_executable())
+            # server_memory_limit is a replay buffer for viewers that connect later; there are
+            # none (a restart re-sends everything), and at 1GiB it was a second copy of the data
+            self.client = ViewerClient.spawn(port=port, memory_limit=VIEWER_MEMORY, server_memory_limit="0B",
+                                             headless=headless, hide_welcome_screen=True,
+                                             executable_path=view.viewer_executable())
         self.scenes: dict[str, Scene] = {}
         self.seen_logs: set[Path] = set()
         self.unreadable: dict[str, float] = {}         # key -> stamp: retried only when the data changes
         self.work: deque = deque()
         self.renderer = None
+        self.active: str | None = None                 # key of the scene the user is looking at
+        self.refocus = False
         self.tables = self._stream("ATE tables", "ATE tables", frames=False)
         self._last = dict.fromkeys(("scan", "tail", "active"), 0.0)
+        self.paused = False
+        self.stdin = sys.stdin
 
     # -- recordings
 
@@ -168,7 +191,7 @@ class App:
             lines.append(f"**live:** {', '.join(p.name[:15] for p in scene.live)}")
         view.log_info(scene.rec, scene.key, lines, scene.runs.values())
 
-    def _add_run(self, scene: Scene, log: Path) -> None:
+    def _add_run(self, scene: Scene, log: Path, *, focus: bool = True) -> None:
         entry = scene.runs[log] = read_run_log(log)
         for p in entry.predictions:
             scene.colors.setdefault((log, p.track), view.PRED_COLORS[len(scene.colors) % len(view.PRED_COLORS)])
@@ -177,37 +200,72 @@ class App:
         view.log_run(scene.rec, scene.seq, scene.T_true, entry, placed, colors)
         if scene.heavy:
             self._clouds(scene, entry, placed, colors)
+        self._layout(scene, make_active=focus and (self.follow or self.starting))
+        self._info(scene)
+
+    def _layout(self, scene: Scene, *, make_active: bool) -> None:
         # make_active switches the viewer to this recording; without it the new
         # default applies on the recording's "reset blueprint"
         self.rr.send_blueprint(view.blueprint(view.hidden_by_default(scene.runs.values(), scene.T_true is not None),
-                                              frames=True), recording=scene.rec,
-                               make_active=self.follow or self.starting)
-        self._info(scene)
+                                              frames=True), recording=scene.rec, make_active=make_active)
 
     def _clouds(self, scene: Scene, entry, placed, colors) -> None:
         view.log_run_clouds(scene.rec, view.samples(scene.src, scene.seq), scene.seq, scene.src.max_depth,
                             entry, placed, colors, own_colors=scene.T_true is None)
 
     def _open(self, scene: Scene) -> None:
+        loaded = sorted((s for s in self.scenes.values() if s.heavy), key=lambda s: s.heavy)
+        if victims := loaded[:max(0, len(loaded) - HEAVY_SCENES + 1)]:
+            for old in victims:
+                self._evict(old.key)
+            self._release_renderer()
+            self._refocus()
         print(f"opening {scene.key}: frames and maps")
         view.log_frames(scene.rec, view.samples(scene.src, scene.seq), scene.seq, scene.T_true,
                         scene.src.max_depth)
         for log, entry in scene.runs.items():
             colors = {p.track: scene.colors[log, p.track] for p in entry.predictions}
             self._clouds(scene, entry, {p.track: view.place(scene.T_true, p) for p in entry.predictions}, colors)
-        scene.heavy = True
+        scene.heavy = time.time()
+
+    def _evict(self, key: str) -> None:
+        """Frees a scene's frames and maps. Clear only tombstones data; closing the recording
+        is what frees it, so the light layers are re-sent into a fresh one."""
+        print(f"evicting {key}: frames and maps")
+        old = self.scenes.pop(key)
+        self.client.close_recordings([r.store_id for r in self.client.viewer_state().recordings
+                                      if r.store_id.endswith(":" + key)])
+        if (scene := self._scene(key)) is None:
+            return
+        scene.colors, scene.live = old.colors, old.live
+        self.scenes[key] = scene
+        for log in old.runs:
+            self._add_run(scene, log, focus=False)
+        self.refocus = True
+
+    def _refocus(self) -> None:
+        # a new recording takes the viewer's focus even after startup (probed), so a re-sent
+        # scene would steal it, be opened, and evict the scene the user was on
+        self.refocus = False
+        if (scene := self.scenes.get(self.active)) is not None:
+            self._layout(scene, make_active=True)
+            scene.rec.flush()
+        self._last["active"] = time.time()           # the switch back lands late; reading now would see the thief
 
     # -- discovery
 
+    def _wanted(self, key: str) -> bool:
+        return any(fnmatch.fnmatchcase(key, p) for p in SHOW)
+
     def scan(self) -> None:
         for cls in self.sources:
-            for key in cls.discover():
+            for key in filter(self._wanted, cls.discover()):
                 stamp = source(key).stamp()
                 if self.unreadable.get(key) != stamp and (key not in self.scenes or self.scenes[key].stamp != stamp):
                     self.work.append(("scene", key))
         per_scene: dict[str, int] = {}
         for log in sorted(self.runs_root.glob(f"*{SUFFIX}"), reverse=True):     # newest first
-            if log in self.seen_logs or not (key := first_record(log).get("name")):
+            if log in self.seen_logs or not (key := first_record(log).get("name")) or not self._wanted(key):
                 continue
             self.seen_logs.add(log)
             closed = is_closed(log)
@@ -233,6 +291,10 @@ class App:
                 self.scenes[key] = scene
             else:
                 self.unreadable[key] = source(key).stamp()
+            return
+        if item[0] == "evict":
+            if item[1] in self.scenes:
+                self._evict(item[1])
             return
         _, log, key, live = item
         scene = self.scenes.get(key) or self._scene(key)
@@ -289,36 +351,63 @@ class App:
 
     def check_active(self) -> None:
         try:
-            active = str(self.client.viewer_state().active_recording)
+            state = self.client.viewer_state()
         except TimeoutError:                           # viewer busy (seen opening a scene under memory pressure)
             return
         # the store id ends ":<recording id>"; the app id before it is rewritten by the viewer
+        active = str(state.active_recording)
         scene = next((s for k, s in self.scenes.items() if active.endswith(":" + k)), None)
+        if scene is not None:
+            self.active = scene.key
+        # recordings the viewer closed at its memory limit come back light; keys contain ":"
+        # so every suffix is a candidate
+        ids = [str(r.store_id) for r in state.recordings]
+        present = {i[j + 1:] for i in ids for j, c in enumerate(i) if c == ":"}
+        now = time.time()
+        self.work.extend(("evict", k) for k, s in self.scenes.items()
+                         if k not in present and now - s.born > RECONCILE_GRACE_S)
         if scene is not None and not scene.heavy:
             self._open(scene)
 
+    def toggle_pause(self) -> None:
+        if self.stdin is None or not select.select([self.stdin], [], [], 0)[0]:
+            return
+        if not self.stdin.readline():
+            self.stdin = None                          # EOF (no terminal): select would stay ready forever
+            return
+        self.paused = not self.paused
+        if self.paused:
+            self._release_renderer()
+            print(f"paused: {len(self.work)} queued; Enter to resume")
+        else:
+            print(f"resumed: {len(self.work)} queued")
+
     def step(self) -> None:
+        self.toggle_pause()
         now = time.time()
-        if now - self._last["scan"] > SCAN_S:
+        # paused scans too: they re-queue every unsent scene each pass
+        if not self.paused and now - self._last["scan"] > SCAN_S:
             self._last["scan"] = now
             self.scan()
         had_work, deadline = bool(self.work), time.time() + WORK_BUDGET_S
-        while self.work and time.time() < deadline:
+        while self.work and not self.paused and time.time() < deadline:
             self._do(self.work.popleft())
         if had_work and not self.work:
             self._release_renderer()
             self.starting = False
+            if self.refocus:
+                self._refocus()
         if now - self._last["tail"] > TAIL_S:
             self._last["tail"] = now
             self.tail()
         # not during startup: the viewer switches to each recording as it arrives
-        if not self.work and now - self._last["active"] > ACTIVE_S:
+        if (not self.work or self.paused) and now - self._last["active"] > ACTIVE_S:
             self._last["active"] = now
             self.check_active()
 
     def run(self) -> None:
         self.latest_table()
-        print(f"watching {[c.__name__ for c in self.sources]} and {self.runs_root}; Ctrl-C to stop")
+        print(f"watching {[c.__name__ for c in self.sources]} and {self.runs_root}; Enter to pause/resume, Ctrl-C to stop")
         while True:
             self.step()
             time.sleep(0.05)

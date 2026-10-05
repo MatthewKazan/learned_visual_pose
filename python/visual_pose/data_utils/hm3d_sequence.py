@@ -24,10 +24,9 @@ from pathlib import Path
 
 import numpy as np
 
-from visual_pose.data_utils.constants import REPO_DIR
+from visual_pose.data_utils.constants import HM3D_ROOTS
 from visual_pose.data_utils.dataset import ArraySequence
 
-HM3D = REPO_DIR / "data" / "hm3d" / "hm3d-minival-habitat-v0.2"
 POSES_FILE = "poses.txt"
 
 T_hab_cv = np.diag([1.0, -1.0, -1.0, 1.0])
@@ -105,7 +104,7 @@ def scene_assets(traj_dir: Path) -> Path:
     local = traj_dir.parents[1]
     if any(local.glob("*.navmesh")):
         return local
-    return HM3D / local.name
+    return scene_dir(local.name)
 
 
 def load_trajectory(traj_dir: Path) -> Trajectory:
@@ -113,9 +112,26 @@ def load_trajectory(traj_dir: Path) -> Trajectory:
                       poses=load_poses(traj_dir / POSES_FILE))
 
 
-def trajectory_dirs(root: Path = HM3D) -> list[Path]:
-    """Every <scene>/trajectories/<name>/ under root that has a poses.txt."""
-    return sorted(d for d in root.rglob("*/trajectories/*/") if (d / POSES_FILE).exists())
+def scene_dirs() -> list[Path]:
+    """Every scene in the active HM3D splits, sorted by name, each name once (first split in HM3D_ACTIVE wins)."""
+    found: dict[str, Path] = {}
+    for root in HM3D_ROOTS:
+        if root.is_dir():
+            for d in root.iterdir():
+                if d.is_dir():
+                    found.setdefault(d.name, d)
+    return [found[name] for name in sorted(found)]
+
+
+def scene_dir(name: str) -> Path:
+    """The scene's directory in the first active split that has it. Missing everywhere: a path under the first split that does not exist, so the caller fails on use."""
+    return next((root / name for root in HM3D_ROOTS if (root / name).is_dir()), HM3D_ROOTS[0] / name)
+
+
+def trajectory_dirs(root: Path | None = None) -> list[Path]:
+    """Every <scene>/trajectories/<name>/ with a poses.txt, under root or, by default, in scene_dirs()."""
+    scenes = [d for d in root.iterdir() if d.is_dir()] if root is not None else scene_dirs()
+    return sorted(d for s in scenes for d in s.glob("trajectories/*/") if (d / POSES_FILE).exists())
 
 
 class HM3DSequence(ArraySequence):

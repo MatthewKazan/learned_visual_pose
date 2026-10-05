@@ -6,6 +6,8 @@ namespace geometry {
 
   using Tangent = Eigen::Matrix<double, 6, 1>;
   using Adjoint = Eigen::Matrix<double, 6, 6>;
+  using Jacobian = Eigen::Matrix<double, 6, 6>;
+
 
   class PoseSE3 {
   public:
@@ -24,6 +26,7 @@ namespace geometry {
     PoseSE3 inverse() const;
     // Get Matrix that changes a 6d motion vector from 1 coord frame to another
     Adjoint adjoint() const;
+    Jacobian right_jacobian() const;
     PoseSE3 operator*(const PoseSE3& other) const;
     Eigen::Vector3d operator*(const Eigen::Vector3d& other) const;
 

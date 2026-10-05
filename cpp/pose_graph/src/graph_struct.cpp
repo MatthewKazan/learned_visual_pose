@@ -153,7 +153,7 @@ namespace pose_graph {
     }
   }
 
-  void FactorGraph::gauss_newton(const double iter_threshold, const bool verbose, const double huber, const double lm_lambda_init) {
+  void FactorGraph::gauss_newton(const double iter_threshold, const bool verbose, const double huber, const double lm_lambda_init, const int max_rejections) {
     if (vertices.size() < 2) {
       throw std::invalid_argument("gauss_newton needs at least 2 vertices");
     }
@@ -163,8 +163,8 @@ namespace pose_graph {
     constexpr int max_iterations = 100;
     int iterations = 0;
 
-    // Levenberg-Marquardt when lm_lambda_init > 0: the step is judged at the
-    // START of the next iteration, where the fresh residuals already are. A
+    // Levenberg-Marquardt when lm_lambda_init > 0: a step is judged at the
+    // start of the next iteration, where its residuals are computed anyway. A
     // step that raised the cost is undone from `saved`, lambda grows and the
     // same linearisation point is retried with a shorter step; a step that
     // lowered it shrinks lambda. lambda = 0 is plain Gauss-Newton.
@@ -172,6 +172,9 @@ namespace pose_graph {
     double lambda = lm_lambda_init;
     double prev_cost = std::numeric_limits<double>::infinity();
     double delta_mag = std::numeric_limits<double>::infinity();   // of the last ACCEPTED step
+    double pending_delta_mag = std::numeric_limits<double>::infinity();   // of the last PENDING step
+    int consecutive_rejections = 0;
+
     std::vector<geometry::PoseSE3> saved(vertices.size());
     bool pending = false;                                          // a step is applied but not yet judged
 
@@ -179,7 +182,10 @@ namespace pose_graph {
     Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic> H(6*vertices.size(), 6*vertices.size());
     Eigen::VectorXd b(6 * vertices.size());
 
-    // residuals at the current poses, and their weighted sum of squares
+    // Residuals at the current poses, and the cost the normal equations below
+    // minimise: Huber's rho(m) = m^2 for m <= k, 2km - k^2 beyond, m the
+    // Mahalanobis distance. Judging on plain m^2 instead rejected good robust
+    // steps, which deliberately let an outlier's m grow.
     const auto evaluate = [&]() {
       double cost = 0.0;
       for (size_t e = 0; e < edges.size(); ++e) {
@@ -187,26 +193,38 @@ namespace pose_graph {
         const geometry::PoseSE3 trans_error = edge.measured_pose.inverse() * vertices[edge.from].pose.inverse() * vertices[edge.to].pose;
         residuals.segment<6>(e * 6) = trans_error.log();
         const auto r = residuals.segment<6>(e * 6);
-        cost += r.dot(edge.info_matrix * r);
+        const double m2 = r.dot(edge.info_matrix * r);
+        if (huber == 0.0 || m2 <= huber * huber)
+          cost += m2;
+        else
+          cost += 2.0 * huber * std::sqrt(m2) - huber * huber;
       }
       return cost;
     };
 
-    while (delta_mag > iter_threshold && iterations++ < max_iterations) {
+    while (delta_mag > iter_threshold && iterations++ < max_iterations && consecutive_rejections < max_rejections) {
       const double cost = evaluate();
 
+      // only a cost that follows an applied step is judged: the restored poses
+      // after a rejection score exactly prev_cost and are not a step
       if (damped && pending) {
         pending = false;
         if (cost > prev_cost) {
+          consecutive_rejections++;
           for (size_t v = 0; v < vertices.size(); ++v) vertices[v].pose = saved[v];
           lambda *= 10.0;
           delta_mag = std::numeric_limits<double>::infinity();   // a rejected step must not end the loop
           if (verbose) std::cout << "  iter " << iterations << "  cost " << cost << " > " << prev_cost << "  rejected, lambda " << lambda << '\n';
+          iterations--;
           continue;                                              // re-evaluates at the restored poses
         }
         lambda = std::max(lambda / 3.0, 1e-9);
+        prev_cost = cost;
+        delta_mag = pending_delta_mag;
+        consecutive_rejections = 0;
       }
-      prev_cost = cost;
+      if (!damped) delta_mag = pending_delta_mag;
+
       if (verbose) {
         std::cout << "  iter " << iterations << "  cost " << cost << "  |delta| " << delta_mag;
         if (damped) std::cout << "  lambda " << lambda;
@@ -219,8 +237,8 @@ namespace pose_graph {
         Edge &edge = edges[i];
         const auto r = residuals.segment<6>(i * 6);
 
-        Eigen::Matrix<double, 6, 6> J_i = -vertices[edge.to].pose.inverse().adjoint();
-        Eigen::Matrix<double, 6, 6> J_j = vertices[edge.to].pose.inverse().adjoint();
+        Eigen::Matrix<double, 6, 6> J_i = geometry::PoseSE3::exp(r).right_jacobian().inverse() * -vertices[edge.to].pose.inverse().adjoint();
+        Eigen::Matrix<double, 6, 6> J_j = geometry::PoseSE3::exp(r).right_jacobian().inverse() * vertices[edge.to].pose.inverse().adjoint();
 
         double w = 1;
         if (huber != 0.0) {
@@ -279,7 +297,7 @@ namespace pose_graph {
             geometry::PoseSE3::exp(delta.segment<6>((v - 1) * 6));
         vertices[v].pose = update * vertices[v].pose;
       }
-      delta_mag = delta.norm();
+      pending_delta_mag = delta.norm();
       pending = true;
     }
 
