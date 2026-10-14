@@ -24,7 +24,7 @@ def gem_pooling(descriptors: torch.Tensor, p: int = 3):
     return F.normalize(torch.pow(sum_desc, 1.0 / p), dim=-1)
 
 
-class AttentionPooling(nn.Module):
+class AttentionPooling2d(nn.Module):
     def __init__(self, descriptor_dim: int, atten_ch: int = 256, kernel_size: int = 4, stride: int = 4, dilation: int = 1):
         super().__init__()
         self.conv = nn.Conv2d(descriptor_dim, atten_ch, kernel_size, stride,
@@ -54,8 +54,8 @@ class AttentionPooling(nn.Module):
 
 
         x = x + pe.unsqueeze(0)  # [B, C, H, W]
-        x = x.flatten(2).transpose(1, 2)
-        x = torch.cat([x, x.mean(dim=1, keepdim=True)], dim=1)
+        x = x.flatten(2).transpose(1, 2) # (B, C, H, W) -> (B, H*W, C)
+        x = torch.cat([x, x.mean(dim=1, keepdim=True)], dim=1) # (B, H*W+1, C)
 
         q = self.w_query(x[:,-1:,:])
         k = self.w_key(x[:, :-1, :])

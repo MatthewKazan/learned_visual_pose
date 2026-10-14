@@ -44,8 +44,8 @@ RECONCILE_GRACE_S = 10    # a recording this new may not be in viewer_state yet:
 
 # ===== EDIT ME: which keys to show. Globs over run.py's RUNS keys; "*" also
 # crosses "/", so "hm3d:00803-*" is every trajectory of that scene.
-SHOW = ["*"]
-# SHOW = ["hm3d:0080*", "hm3d:0081*", "hm3d:0082*", "bag:*"]
+# SHOW = ["*"]
+SHOW = ["hm3d:0080*", "hm3d:0081*", "hm3d:0082*", "bag:*"]
 # SHOW = ["hm3d:*/trajectory_0[0-9]"]
 # Source type -> (rec, src, renderer) -> info lines. The renderer is a SceneRenderer
 # for the source's scene, opened only for these.

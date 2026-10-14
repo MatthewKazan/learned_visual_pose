@@ -16,6 +16,7 @@ from typing import Callable
 
 import numpy as np
 import torch
+from torch import Tensor
 
 from visual_pose import _geometry as cpp
 from visual_pose.config import Config
@@ -219,3 +220,4 @@ def save_graph(traj_dir: Path, front: Frontend, variant: Variant, split: str | N
         arrays["gt_poses"] = np.asarray([sequence.pose(f) for f in order], dtype=np.float64).reshape(-1, 4, 4)
     np.savez(traj_dir / GRAPH_SIDECAR, **arrays)
     return summary
+

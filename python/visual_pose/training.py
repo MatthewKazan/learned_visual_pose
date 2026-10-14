@@ -25,6 +25,16 @@ from visual_pose.data_utils.constants import DEVICE
 from visual_pose.data_utils.loaders import on_device
 
 MAX_SKIPPED_STEPS = 5   # consecutive non-finite gradients before fit gives up
+# Batches between returning the accelerator's cached memory. Variable batch shapes
+# (padded graphs) leave freed blocks of every size cached on MPS: the transformer
+# run went 4.8 -> 32 GB in two minutes and swapped, 2026-10-12.
+EMPTY_CACHE_EVERY = 20
+
+
+def empty_cache() -> None:
+    """Return cached-but-unused accelerator memory to the system; no-op without one."""
+    if torch.accelerator.is_available():
+        torch.accelerator.empty_cache()
 
 StepFn = Callable[[nn.Module, dict[str, Tensor]], Tensor]
 EvalFn = Callable[[nn.Module, DataLoader], float]
@@ -87,6 +97,7 @@ def fit(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader,
         model.eval()
         with torch.no_grad():
             best = evaluate(model, val_loader)
+        empty_cache()
         save_checkpoint(s.checkpoint_dir / "best.pt", model, optimizer, scheduler, -1, best, metric_name)
         print(f"before training {metric_name}: {best:.4f}")
     for epoch in range(s.num_epochs):
@@ -101,6 +112,7 @@ def fit(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader,
                     raise FloatingPointError(f"non-finite loss at epoch {epoch + 1}, batch {batch_i + 1}")
                 optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 # MPS has returned NaN gradients from finite inputs (training_aggregator);
                 # skipping that step keeps the weights clean, a run of them means a real bug
                 if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
@@ -112,6 +124,8 @@ def fit(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader,
                 skipped = 0
                 optimizer.step()
                 running += loss.item()
+            if (batch_i + 1) % EMPTY_CACHE_EVERY == 0:
+                empty_cache()
             # +1 so the first print averages a full window rather than one batch
             if (batch_i + 1) % s.print_freq == 0:
                 print(f"[epoch {epoch + 1}/{s.num_epochs}, batch {batch_i + 1:5d}/{len(train_loader)}] "
@@ -126,6 +140,7 @@ def fit(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader,
         model.eval()
         with torch.no_grad():
             value = evaluate(model, val_loader)
+        empty_cache()
 
         # last.pt every evaluation so a crash costs little; best.pt only on
         # improvement, so it survives later overfitting

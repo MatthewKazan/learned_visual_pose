@@ -17,6 +17,7 @@ dependencies = [
     "matplotlib",
     "scipy",            # Rotation.from_quat in data_utils.dataset
     "opencv-python",    # imread / cvtColor in data_utils.dataset
+    "roma",             # differentiable batched SO(3) exp (rotvec_to_rotmat) in the transformer loss
 ]
 
 [project.optional-dependencies]

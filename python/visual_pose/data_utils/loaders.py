@@ -12,7 +12,7 @@ from torch import Tensor
 from torch.utils.data import DataLoader, ConcatDataset
 
 from visual_pose.data_utils.wide_baseline_CNN import WideBaselineDataset
-from visual_pose.config import Config
+from visual_pose.config import Config, TransformerSolverConfig
 from visual_pose.data_utils.constants import DEVICE, REPO_DIR
 from visual_pose.data_utils.dataset import FrameSequence, TartanAirSequence
 from visual_pose.data_utils.training_dataset_CNN import TACorrespondenceDataset
@@ -161,6 +161,63 @@ def build_loop_closure_probe_loader(cfg: Config = Config()) -> DataLoader:
     from visual_pose.data_utils.loop_closure_dataset import LoopClosureTrajectories, trajectory_keys
     keys = [k for k in trajectory_keys("train") if k.endswith("trajectory_00")][:cfg.aggregator_train_probe_scenes]
     return DataLoader(LoopClosureTrajectories(keys=keys), batch_size=1, num_workers=2, persistent_workers=True)
+
+
+def split_trajectories(cfg: TransformerSolverConfig) -> tuple[list, list]:
+    """
+    Every trajectory with a pose graph, split (train, val) at random by SCENE,
+    cfg.train_fraction of the scenes to train: a scene's 10 trajectories share a
+    house, so splitting trajectories would put the same rooms on both sides.
+    Same cfg.seed, same split.
+    """
+    from visual_pose.data_utils.pose_graph_samples import graph_dirs
+    trajectories = graph_dirs()
+    scenes = sorted({t.parents[1] for t in trajectories})
+    np.random.default_rng(cfg.seed).shuffle(scenes)
+    train_scenes = set(scenes[:round(cfg.train_fraction * len(scenes))])
+    train = [t for t in trajectories if t.parents[1] in train_scenes]
+    val = [t for t in trajectories if t.parents[1] not in train_scenes]
+    return train, val
+
+
+def pad(batch: list[Tensor]) -> tuple[Tensor, Tensor]:
+    n = -(-max(b.shape[0] for b in batch) // 64) * 64
+    padded = torch.zeros((len(batch), n, *batch[0].shape[1:]), dtype=batch[0].dtype)
+    # True = padding, nn.MultiheadAttention's key_padding_mask convention
+    mask = torch.ones((len(batch), n), dtype=torch.bool)
+    for i, b in enumerate(batch):
+        padded[i, :b.shape[0]] = b
+        mask[i, :b.shape[0]] = False
+    return padded, mask
+
+
+def collate_pose_graph_ds(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
+    ret = {}
+    for key in batch[0].keys():
+        if batch[0][key] is None:   # an input switched off, e.g. descriptors
+            ret[key] = None
+            continue
+        ret[key], mask = pad([b[key] for b in batch])
+        if key == 'poses':
+            ret["vertex_mask"] = mask
+        elif key == 'closures':
+            ret["closure_mask"] = mask
+        elif key == 'odometry':
+            ret["odom_mask"] = mask
+    return ret
+
+
+def build_transformer_loaders(cfg: TransformerSolverConfig) -> tuple[DataLoader, DataLoader]:
+    """(train_loader, val_loader) of PoseGraphDataset over split_trajectories(cfg).
+    Graphs differ in V, O and L, so batch_size > 1 needs a collate_fn that pads."""
+    from visual_pose.data_utils.pose_graph_dataset import PoseGraphDataset
+    train, val = split_trajectories(cfg)
+    loader = dict(batch_size=cfg.batch_size, collate_fn=collate_pose_graph_ds, num_workers=2, persistent_workers=True)
+    # descriptors loaded exactly when the model uses them
+    ds = dict(pass_descriptor=cfg.use_descriptor, num_points=cfg.points_per_keyframe)
+    return (DataLoader(PoseGraphDataset(train, **ds), shuffle=True, **loader),
+            DataLoader(PoseGraphDataset(val, random_points=False, **ds), shuffle=False, **loader))
+
 
 
 def on_device(loader: DataLoader,

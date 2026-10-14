@@ -8,6 +8,7 @@ it, and a sweep is a command line rather than an edit.
 """
 from dataclasses import dataclass, fields, asdict, replace
 from pathlib import Path
+from typing import Optional
 
 from visual_pose.data_utils.constants import REPO_DIR
 
@@ -259,8 +260,14 @@ class Config:
 
     # Closures whose both endpoints lie within this many keyframes of a
     # cluster's first closure are one revisit and share one closure's weight
-    # (WorldModel.calibrate). UNTUNED.
-    loop_closure_range: int = 5
+    # (WorldModel.calibrate). 0 = off: every closure is its own cluster.
+    # Measured inert at 5 on 110 HM3D graphs, 2026-10-05, solved from the
+    # saved raw information both ways: aligned ATE mean 0.218 -> 0.217 m,
+    # median 0.066 -> 0.067, better on 26, worse on 32, unchanged on 52.
+    # Clusters formed as intended (median 60 closures in 7 clusters), so the
+    # solve is not limited by how much a constrained revisit is trusted but by
+    # the revisits with no closure at all (2 of 11 reached on trajectory_00).
+    loop_closure_range: int = 0
 
     @property
     def checkpoint_dir(self) -> Path:
@@ -286,3 +293,71 @@ class Config:
                     darkness_threshold=self.darkness_threshold,
                     max_depth=self.max_depth,
                     occlusion_tol=self.occlusion_tol)
+
+@dataclass
+class TransformerSolverConfig:
+    num_point_samples: int = 512
+    descriptor_dim: int = 384
+    num_heads: int = 8
+    embed_dim: int = 256
+    ff_dim: int = 1024
+    dropout: float = 0.1
+    num_layers: int = 6
+    # Sweep 2026-10-13 (out/sweep/summary.json, 8 epochs, 20-graph ATE median): batch 1 0.145
+    # vs batch 2 0.154 at lr 1e-4 -- twice the optimizer steps per epoch.
+    batch_size: int = 1
+    seed: int = 42
+    # Fraction of SCENES in train; the rest are val.
+    train_fraction: float = 0.8
+    points_per_keyframe: int = 64   # 64 / 128 / 256 all within noise; 64 peaks at 4.6 GB vs 19 GB at 256
+    use_descriptor: bool = False
+
+    # AdamW, not the CNN's SGD 0.01: the usual transformer choice.
+    optimizer: str = "adamw"
+    # Sweep: 1e-4 median 0.154, 3e-4 0.163, 5e-5 0.159, 5e-4 stuck at odometry (0.246).
+    learning_rate: float = 1e-4
+    weight_decay: float = 1e-2
+    # 16-epoch cosine: median 0.140 / aligned 0.093, vs 0.145 / 0.093 at 8; the old 50-epoch
+    # runs plateaued by epoch ~14 at 0.165 / 0.103.
+    num_epochs: int = 16
+    print_freq: int = 20
+    # ATE against cached GN (experiments/gn_baseline.py) on the first N val trajectories
+    ate_eval_every: int = 2
+    ate_eval_trajectories: int = 20
+
+    run_name: str = "transformer_best"   # where THIS run saves: checkpoints/<run_name>/
+    # best so far: checkpoints/sweep_final_lr1e4_b1_p64_e16/best.pt (this config, 16 epochs)
+    starting_checkpoint: Optional[str] = None
+    loss_trans_weight: float = 0.36
+    loss_huber_threhold: float = 1.0
+    loss_fn: str = "chordial_relative"   # l2 | chordial (vertex only) | chordial_relative (pose_loss)
+    # Sweep: odom 0.5 and Huber 2.0 within noise of these; closure 2.0 worse (median 0.199),
+    # Huber 0.5 worse (0.204), translation weight 1.0 and dropout 0 no better.
+    loss_relative_odom_weight: float = 1.0
+    loss_relative_closure_weight: float = 1.0
+
+    # 1 = single pass. Iteration lost in every form tried: 3 random-depth passes from scratch
+    # median 0.169 / aligned 0.107 vs 0.163 / 0.098; 3 passes with gradients throughout
+    # 0.152 / 0.102 vs 0.145 / 0.093 at batch 1, 64 points (and 2x slower).
+    refinement_iterations: int = 1
+    # False: random-depth no-grad passes + one trained pass (memory 1 pass). True: all passes
+    # in the loss with gradients through them (memory ~refinement_iterations passes).
+    refinement_backprop: bool = False
+
+    @property
+    def checkpoint_dir(self) -> Path:
+        # per-run directory so runs stop overwriting each other's best.pt
+        return REPO_DIR / "checkpoints" / self.run_name
+
+    @property
+    def starting_checkpoint_path(self) -> Optional[Path]:
+        """starting_checkpoint resolved: absolute as given, else relative to checkpoints/."""
+        if not self.starting_checkpoint:
+            return None
+        path = Path(self.starting_checkpoint)
+        return path if path.is_absolute() else REPO_DIR / "checkpoints" / path
+
+    def train_settings(self) -> TrainSettings:
+        """The TrainSettings fields this config sets; the rest keep TrainSettings' defaults."""
+        return TrainSettings(**{f.name: getattr(self, f.name) for f in fields(TrainSettings)
+                                if hasattr(self, f.name)})

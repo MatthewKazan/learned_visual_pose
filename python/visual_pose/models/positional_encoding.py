@@ -1,7 +1,12 @@
 import torch
 import math
 
-def positional_encoding_2d(h, w, d_dim, device):
+from torch import nn
+
+from visual_pose.data_utils.constants import DEVICE
+
+
+def positional_encoding_2d(h, w, d_dim, device = DEVICE):
     assert d_dim % 4 == 0
 
     d_axis = d_dim // 2
@@ -29,3 +34,16 @@ def positional_encoding_2d(h, w, d_dim, device):
     pe[:, :, d_axis:] = pe_x[None, :, :]
 
     return pe
+
+
+def positional_encoding_1d(seq_len: int, input_dim: int, max_len: int = 10000, device = DEVICE):
+        # PE_{(pos,2i)} = sin(pos / 10000^{2i/\dmodel}) \\                        #
+        # PE_{(pos,2i+1)} = cos(pos / 10000^{2i/\dmodel})                         #
+
+        pe = torch.zeros(seq_len, input_dim)
+        denom = max_len ** (torch.arange(0, input_dim, 2) / input_dim)
+        # Works because of pytorch broadcasting, need unssqueeze for broadcasting to work
+        pe[:, 0::2] = torch.sin(torch.arange(seq_len).unsqueeze(1) / denom)
+        pe[:, 1::2] = torch.cos(torch.arange(seq_len).unsqueeze(1) / denom)
+
+        return pe.to(device)

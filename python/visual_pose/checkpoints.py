@@ -46,8 +46,8 @@ def load_learned_pooling(run_name: str = "attention_pooling_infonce", input_dim:
     A trained AttentionPooling as a WorldModel pooling_method: (B, 256, H', W')
     backbone map -> (B, D) unit fingerprint, a drop-in for gem_pooling.
     """
-    from visual_pose.models.global_descriptor import AttentionPooling
-    model = AttentionPooling(input_dim).to(DEVICE).eval()
+    from visual_pose.models.global_descriptor import AttentionPooling2d
+    model = AttentionPooling2d(input_dim).to(DEVICE).eval()
     state = torch.load(REPO_DIR / "checkpoints" / run_name / checkpoint, map_location=DEVICE, weights_only=False)
     weights = state["model"]
     if any(k.startswith("pool.") for k in weights):   # trained inside SigmoidScaled: keep the pooling only
