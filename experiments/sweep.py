@@ -31,11 +31,11 @@ from optuna.trial import create_trial
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from visual_pose.config import Config
-from visual_pose.data_utils.constants import DEVICE, REPO_DIR
+from visual_pose.config.config import Config
+from visual_pose.config.constants import DEVICE, REPO_DIR
 from visual_pose.models.descriptor_cnn import DescriptorCNN
-from visual_pose.training import fit
-from visual_pose.training_CNN import cnn_evaluate, cnn_step
+from visual_pose.training.fit import fit
+from visual_pose.training.cnn import cnn_evaluate, cnn_step
 
 # Cheap stand-in for the real problem.
 # P000 (bright indoor hospital) + P006 (dark japanese alley) keeps the

@@ -2,11 +2,11 @@ import torch
 from torch import Tensor, nn
 from torch.utils.data import DataLoader
 
-from visual_pose.config import TransformerSolverConfig
+from visual_pose.config.config import TransformerSolverConfig
 from visual_pose.data_utils.loaders import on_device
 from visual_pose.geometry.graph_math import relative, predicted_poses, update_graph_with_tangent_delta, \
-    update_ground_truth_residual
-from visual_pose.training import EMPTY_CACHE_EVERY, empty_cache
+    update_ground_truth_residual, rotate_points_to_world
+from visual_pose.training.fit import EMPTY_CACHE_EVERY, empty_cache
 from roma import rotvec_to_rotmat
 
 
@@ -31,9 +31,10 @@ def huber(error: Tensor, threshold: float) -> Tensor:
 
 
 def masked_mean(err: Tensor, padding: Tensor) -> Tensor:
-    """Mean of err (B, N) over real entries; padding (B, N) bool, True = padding. 0 when nothing is real."""
+    """Mean of err (B,V) over real entries; padding (B, N) bool, True = padding. 0 when nothing is real."""
     real = (~padding).float()                                    # (B, N)
-    return (err * real).sum() / real.sum().clamp(min=1)         # clamp: a batch can have no closures at all
+    return (err * real).sum(dim=1) / real.sum(dim=1).clamp(min=1)
+
 
 
 def pose_distance(pred_R: Tensor, pred_t: Tensor, target_R: Tensor, target_t: Tensor,
@@ -65,7 +66,7 @@ def relative_loss(predicted_delta: Tensor, batch: dict[str, Tensor], cfg: Transf
     """
     pred_R, pred_t = predicted_poses(predicted_delta, batch["poses"])        # (B, V, 3, 3), (B, V, 3)
     gt_R, gt_t = batch["gt_poses"][..., :3, :3], batch["gt_poses"][..., :3, 3]
-    loss = predicted_delta.new_zeros(())
+    loss = predicted_delta.new_zeros((predicted_delta.shape[0]))
     for ij_key, mask_key, weight in (("odometry_ij", "odom_mask", cfg.loss_relative_odom_weight), ("closures_ij", "closure_mask", cfg.loss_relative_closure_weight)):
         ij = batch[ij_key]                                           # (B, E, 2)
         err = pose_distance(*relative(pred_R, pred_t, ij), *relative(gt_R, gt_t, ij), cfg)  # (B, E)
@@ -77,7 +78,14 @@ def weighted_l2_loss(predicted_delta: Tensor, batch: dict[str, Tensor], cfg: Tra
     """L2 on tangent-space delta vs delta_target (B, V, 6). Superseded: Log's cut at 180 deg, unbounded."""
     err = predicted_delta - batch['delta_target']                    # (B, V, 6)
     err[..., :3] *= cfg.loss_trans_weight
-    return masked_mean((err ** 2).sum(dim=-1), batch['vertex_mask'])
+    return masked_mean((err ** 2).sum(dim=-1), batch['vertex_mask']).mean()
+
+
+def chordial_relative(predicted_delta: Tensor, batch: dict[str, Tensor], cfg: TransformerSolverConfig) -> Tensor:
+    err = vertex_loss(predicted_delta, batch, cfg) + relative_loss(predicted_delta, batch, cfg)
+    c = cfg.chordial_cap
+    capped_err = c * torch.log1p(err / c)
+    return capped_err.mean()
 
 
 def pose_loss(predicted_delta: Tensor, batch: dict[str, Tensor], cfg: TransformerSolverConfig) -> Tensor:
@@ -87,9 +95,17 @@ def pose_loss(predicted_delta: Tensor, batch: dict[str, Tensor], cfg: Transforme
     if cfg.loss_fn == "chordial":
         return vertex_loss(predicted_delta, batch, cfg)
     if cfg.loss_fn == "chordial_relative":
-        return (vertex_loss(predicted_delta, batch, cfg)
-                + relative_loss(predicted_delta, batch, cfg))
+        return chordial_relative(predicted_delta, batch, cfg)
     raise ValueError(f"Unknown loss function: {cfg.loss_fn}")
+
+
+def model_input(batch: dict[str, Tensor], rotate_points: bool = True) -> dict[str, Tensor]:
+    d = {k: batch[k] for k in MODEL_INPUTS}
+    d['closure_mask'] = d['closure_mask'] | batch['closure_dropout']
+    if rotate_points:   # cfg.rotate_points
+        # into d, never batch: batch['points'] stays in the camera frame, so each pass rotates once
+        d['points'] = rotate_points_to_world(batch['points'], batch['poses'])
+    return d
 
 
 def trans_step(model: nn.Module, batch: dict[str, Tensor], cfg: TransformerSolverConfig,
@@ -106,10 +122,10 @@ def trans_step(model: nn.Module, batch: dict[str, Tensor], cfg: TransformerSolve
     if cfg.refinement_backprop and random_depth:
         # Training alternative: every pass in the loss, gradients through all of them (unrolled,
         # like RAFT). Memory ~ refinement_iterations passes; evaluation still takes the path below.
-        loss = 0.0
+        loss = None
         for _ in range(cfg.refinement_iterations):
-            pred = model(**{k: batch[k] for k in MODEL_INPUTS})   # (B, V, 6)
-            loss = loss + pose_loss(pred, batch, cfg)
+            pred = model(**model_input(batch, cfg.rotate_points))   # (B, V, 6)
+            loss = loss + pose_loss(pred, batch, cfg) if loss is not None else pose_loss(pred, batch, cfg)
             batch['poses'] = update_graph_with_tangent_delta(batch['poses'], pred)
             batch['delta_target_mat'], batch['delta_target'] = update_ground_truth_residual(batch['poses'], batch['gt_poses'])
         return loss / cfg.refinement_iterations
@@ -119,12 +135,12 @@ def trans_step(model: nn.Module, batch: dict[str, Tensor], cfg: TransformerSolve
     model.eval()
     with torch.no_grad():
         for _ in range(k):
-            pred = model(**{k: batch[k] for k in MODEL_INPUTS})   # (B, V, 6)
+            pred = model(**model_input(batch, cfg.rotate_points))   # (B, V, 6)
             batch['poses'] = update_graph_with_tangent_delta(batch['poses'], pred)
             batch['delta_target_mat'], batch['delta_target'] = update_ground_truth_residual(batch['poses'], batch['gt_poses'])
     if train:
         model.train()
-    pred = model(**{k: batch[k] for k in MODEL_INPUTS})  # (B, V, 6)
+    pred = model(**model_input(batch, cfg.rotate_points))  # (B, V, 6)
     return pose_loss(pred, batch, cfg)
 
 

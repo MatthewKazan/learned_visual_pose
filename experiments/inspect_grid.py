@@ -11,7 +11,7 @@ which blocks on a GUI backend.
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt, numpy as np, torch
 from visual_pose.data_utils.dataset import TartanAirSequence
-from visual_pose.data_utils.constants import REPO_DIR, INTRINSICS_TARTAN_AIR as K
+from visual_pose.config.constants import REPO_DIR, INTRINSICS_TARTAN_AIR as K
 from visual_pose.geometry.true_correspondences import (
     sample_pixel_grid, back_project, transform_points, project,
     valid_depth_mask, in_image_mask, not_occluded_mask)

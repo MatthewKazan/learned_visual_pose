@@ -3,6 +3,7 @@ from roma import rotvec_to_rotmat, rotmat_to_rotvec
 from torch import Tensor
 
 
+
 def relative(R: Tensor, t: Tensor, ij: Tensor) -> tuple[Tensor, Tensor]:
     """
     Per edge, pose of j seen from i, as Z_ij = T_i^-1 T_j: R_i^T R_j and R_i^T (t_j - t_i).
@@ -61,6 +62,13 @@ def update_ground_truth_residual(updated_poses: Tensor, gt_poses: Tensor) -> tup
 
 
 
+def rotate_points_to_world(points: Tensor, poses: Tensor):
 
-
-
+    # (B, V, 3, 3) @ (B, V, P, 3)
+    pose_mat = poses.unflatten(-1, (3, 4))
+    R_in, t_in = pose_mat[..., :3, :3], pose_mat[..., :3, 3]
+    # pose->world(B, V, 3, 3) @ point in pose frame(B, V, 3, P) = point in world frame(B, V, 3, P)
+    points = (R_in @ points.transpose(-1, -2)).transpose(-1, -2)
+    # if add_translation:
+    #     points = points + t_in.unsqueeze(-2)
+    return points

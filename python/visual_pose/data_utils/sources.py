@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 
 from visual_pose.data_utils.bag_sequence import BAGS, read_bag
-from visual_pose.data_utils.constants import REPO_DIR
+from visual_pose.config.constants import REPO_DIR
 from visual_pose.data_utils.dataset import FrameSequence, TartanAirSequence
 from visual_pose.data_utils.hm3d_sequence import POSES_FILE, T_hab_cv, load_poses, scene_dir, trajectory_dirs
 

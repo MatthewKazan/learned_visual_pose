@@ -20,11 +20,12 @@ would be 2.5 m).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 import numpy as np
 
-from visual_pose.data_utils.constants import HM3D_ROOTS
+from visual_pose.config.constants import HM3D_ROOTS, HM3D_SCENES, HM3D_SPLITS
 from visual_pose.data_utils.dataset import ArraySequence
 
 POSES_FILE = "poses.txt"
@@ -37,7 +38,7 @@ IMAGE_SIZE = (480, 640)   # (H, W) for every HM3D render: generator, GUI and run
 def intrinsics_from_hfov(hfov_deg: float, H: int, W: int) -> np.ndarray:
     """Square pixels, principal point at the image centre: fx = (W/2) / tan(hfov/2)."""
     fx = (W / 2) / np.tan(np.radians(hfov_deg) / 2)
-    return np.array([[fx, 0, W / 2], [0, fx, H / 2], [0, 0, 1]], dtype=np.float32)
+    return np.array([[fx, 0, W / 2 - 0.5], [0, fx, H / 2 - 0.5], [0, 0, 1]], dtype=np.float32)
 
 
 def simulator_config(scene_dir: Path, image_size: tuple[int, int] = IMAGE_SIZE):
@@ -112,14 +113,22 @@ def load_trajectory(traj_dir: Path) -> Trajectory:
                       poses=load_poses(traj_dir / POSES_FILE))
 
 
-def scene_dirs() -> list[Path]:
-    """Every scene in the active HM3D splits, sorted by name, each name once (first split in HM3D_ACTIVE wins)."""
+def scene_dirs(role: str | None = None, scene: str = "*") -> list[Path]:
+    """
+    The scenes of one HM3D_SCENES role ("training" | "validation"), or of both, whose
+    folder name matches the glob `scene` ("0080*", "00853-*"), sorted by name. The one
+    scene filter: run.hm3d and the renderer both go through it. A split folder that is
+    missing (drive unmounted) contributes nothing.
+    """
     found: dict[str, Path] = {}
-    for root in HM3D_ROOTS:
-        if root.is_dir():
-            for d in root.iterdir():
-                if d.is_dir():
-                    found.setdefault(d.name, d)
+    for r in [role] if role else list(HM3D_SCENES):
+        for split, numbers in HM3D_SCENES[r].items():
+            root = HM3D_SPLITS[split]
+            if root.is_dir():
+                for d in root.iterdir():
+                    if (d.is_dir() and d.name[:5].isdigit() and int(d.name[:5]) in numbers
+                            and fnmatchcase(d.name, scene)):
+                        found.setdefault(d.name, d)
     return [found[name] for name in sorted(found)]
 
 

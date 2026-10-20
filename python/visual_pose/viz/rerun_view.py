@@ -21,7 +21,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from visual_pose.data_utils.constants import REPO_DIR
+from visual_pose.config.constants import REPO_DIR
 from visual_pose.evaluation.metrics import rigid_alignment
 from visual_pose.geometry.true_correspondences import back_project, transform_points
 

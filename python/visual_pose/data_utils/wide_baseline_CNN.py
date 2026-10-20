@@ -4,10 +4,10 @@ from multiprocessing import Pool, cpu_count
 import torch
 
 from visual_pose.data_utils.dataset import TartanAirSequence
-from visual_pose.config import Config
+from visual_pose.config.config import Config
 from visual_pose.data_utils.loop_closures import LoopClosures
 from visual_pose.data_utils.training_dataset_CNN import TACorrespondenceDataset
-from visual_pose.data_utils.constants import REPO_DIR
+from visual_pose.config.constants import REPO_DIR
 
 
 class WideBaselineDataset(TACorrespondenceDataset):

@@ -19,6 +19,7 @@ Both caches are built ahead of training, labels on CPU then candidates on GPU:
     PYTHONPATH=. .venv/bin/python -m visual_pose.data_utils.loop_closure_dataset
 """
 from dataclasses import replace
+from functools import cache
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
 
@@ -26,9 +27,10 @@ import numpy as np
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
-from torchvision.transforms import ColorJitter
+from torchvision.transforms import ColorJitter, RandomHorizontalFlip
 
-from visual_pose.config import Config
+from visual_pose.config.config import Config
+from visual_pose.config.constants import HM3D_SPLITS
 from visual_pose.data_utils.loop_closures import CACHE_DIR, LoopClosures
 from visual_pose.data_utils.sources import HM3DSource, SavedHM3DFrames, source
 
@@ -44,11 +46,23 @@ def trajectory_keys(split: str) -> list[str]:
     return [k for k in HM3DSource.discover() if split_of(k) == split]
 
 
+@cache
+def _descriptor_scenes() -> list[str]:
+    return sorted(d.name for d in HM3D_SPLITS["val"].iterdir() if d.is_dir())
+
+
 def split_of(key: str) -> str:
-    """"train" or "val" for an hm3d key. Every descriptor and pooling run so far
-    trained on "train" only, so Phase 3 must test on "val" scenes."""
-    scenes = sorted({k.split("/")[0] for k in HM3DSource.discover()})
-    return "val" if scenes.index(key.split("/")[0]) % VAL_EVERY == 0 else "train"
+    """
+    "train" or "val" for an hm3d key, "unused" outside Matterport's val split. Every
+    descriptor and pooling run so far trained on "train" only, so Phase 3 must test on
+    "val" scenes. Indexed over Matterport's val scenes alone, not every scene on disk:
+    adding scenes to HM3D_SCENES must not reshuffle which of these are train.
+    """
+    scene = key.split("/")[0].removeprefix(HM3DSource.prefix)
+    scenes = _descriptor_scenes()
+    if scene not in scenes:
+        return "unused"
+    return "val" if scenes.index(scene) % VAL_EVERY == 0 else "train"
 
 
 def loop_closures(key: str) -> LoopClosures:
@@ -64,7 +78,7 @@ def _candidate_path(key: str) -> Path:
 
 def build_candidates(keys: list[str]) -> None:
     """(K, 2) frame pairs WorldModel.loop_candidates proposes, per trajectory. GPU."""
-    from visual_pose.checkpoints import load_cnn_model
+    from visual_pose.training.checkpoints import load_cnn_model
     from visual_pose.models.global_descriptor import gem_pooling
     from visual_pose.pose_graph.world_model import WorldModel
     model = load_cnn_model(CFG).eval()
@@ -121,6 +135,7 @@ class LoopClosureDataset(Dataset):
                                        pairs_per_cell)
         self.jitter = ColorJitter(brightness=jitter, contrast=jitter,
                                   saturation=jitter, hue=jitter / 8) if augment else None
+        self.reflect = RandomHorizontalFlip(p=0.5)
 
     @staticmethod
     def _sample(t: int, overlap: np.ndarray, candidates: np.ndarray, rng: np.random.Generator,
@@ -143,7 +158,9 @@ class LoopClosureDataset(Dataset):
 
     def _image(self, t: int, i: int) -> Tensor:
         img = torch.from_numpy(self.frames[t].rgb(i)).permute(2, 0, 1).float() / 255.0
-        return self.jitter(img) if self.jitter is not None else img   # separate draw per image
+        img = self.jitter(img) if self.jitter is not None else img   # separate draw per image
+        img = self.reflect(img) if self.reflect is not None else img
+        return img
 
     def __getitem__(self, index: int) -> dict[str, Tensor]:
         t, i, j, label, hard = self.items[index]

@@ -1,6 +1,6 @@
 import matplotlib.pyplot as plt
 from visual_pose.data_utils.dataset import TartanAirSequence
-from visual_pose.data_utils.constants import REPO_DIR, INTRINSICS_TARTAN_AIR
+from visual_pose.config.constants import REPO_DIR, INTRINSICS_TARTAN_AIR
 from visual_pose.geometry.true_correspondences import (
     generate_correspondences
 )

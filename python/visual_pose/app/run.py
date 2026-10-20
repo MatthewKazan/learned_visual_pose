@@ -16,15 +16,16 @@ import time
 import traceback
 from dataclasses import dataclass, fields, replace
 from enum import StrEnum
-from functools import partial
+from functools import cache, partial
 
 import numpy as np
 import torch
 
+from visual_pose.pose_graph.solvers import gauss_newton_solver, transformer_solver
 from visual_pose import _geometry as cpp
-from visual_pose.checkpoints import LearnedPooling, load_cnn_model
-from visual_pose.config import Config
-from visual_pose.data_utils.constants import HM3D_ROOTS
+from visual_pose.training.checkpoints import LearnedPooling, load_cnn_model, load_transformer
+from visual_pose.config.config import Config
+from visual_pose.config.constants import HM3D_ROOTS
 from visual_pose.data_utils.hm3d_sequence import POSES_FILE, scene_dirs
 from visual_pose.data_utils.sources import source
 from visual_pose.evaluation import metrics
@@ -41,7 +42,7 @@ class GraphSolver(StrEnum):
     """What runs on the graph of chained edges. NONE = frontend only."""
     NONE = "none"
     GAUSS_NEWTON = "gauss newton"
-    # TRANSFORMER = "transformer"     # Phase 3: add one entry to GRAPH_SOLVERS
+    TRANSFORMER = "transformer"     # Phase 3: add one entry to GRAPH_SOLVERS
 
 
 @dataclass
@@ -111,7 +112,7 @@ def hm3d(scene: str = "*", trajectory: str = "trajectory_*") -> list[str]:
         hm3d("00801-*", "trajectory_2[0-5]")
     """
     keys = [f"hm3d:{path.parent.parent.parent.name}/{path.parent.name}"
-            for d in scene_dirs() if d.match(scene)
+            for d in scene_dirs(scene=scene)
             for path in sorted(d.glob(f"trajectories/{trajectory}/{POSES_FILE}"))]
     if not keys:
         # Or a typo'd glob quietly runs nothing.
@@ -124,7 +125,7 @@ def hm3d(scene: str = "*", trajectory: str = "trajectory_*") -> list[str]:
 # What everything below starts from. Anything not named here keeps Config's
 # default, and labels name whatever differs.
 BASE = Config(
-    run_name="fine_tuning_wide_baseline_2",     # which descriptor weights
+    run_name="fine_tuning_wide_baseline_3",     # which descriptor weights; _2 + flip augmentation, 2 epochs
     max_depth=100.0,              # 30 is the TRAINING filter; evaluation has
                                   # always run at 100 (TartanAir gives ~1e4 for sky)
     max_edges=None,                 # None = the whole sequence
@@ -243,13 +244,38 @@ GRAPH_LINESTYLE = "--"
 
 # ===========================================================================
 
+# The transformer graph solver's weights: checkpoints/<run>/best.pt with the config.json it was
+# trained with. c1_cap01_oldtok_e16, 20 HM3D eval graphs, median ATE: 0.151 m (aligned 0.082)
+# against odometry 0.265 (0.095) and GN 0.052 (0.027), 2026-10-19.
+TRANSFORMER_RUN = "c1_cap01_oldtok_e16"
+
+
+@cache
+def _transformer(run_name: str):
+    """Loaded once per process, however many variants use it."""
+    return load_transformer(run_name)
+
+
+@cache
+def _semantic_descriptor():
+    """DINOv2, the descriptor the samples' descriptors_pvd.npy came from; only for a model that uses them."""
+    from visual_pose.models.dino_v2 import SemanticDescriptor
+    return SemanticDescriptor()
+
+
+def _transformer_solve(config):
+    model, cfg = _transformer(TRANSFORMER_RUN)
+    return partial(transformer_solver, model=model, cfg=cfg,
+                   descriptor_model=_semantic_descriptor() if cfg.use_descriptor else None)
+
+
 # graph_solver -> (config) -> SolveFn. The C++ method already matches the
-# contract, so no wrapper. The transformer goes here. Edge solvers:
-# frontend.EDGE_SOLVERS.
+# contract, so no wrapper. Edge solvers: frontend.EDGE_SOLVERS.
 GRAPH_SOLVERS = {
     GraphSolver.GAUSS_NEWTON: lambda config: partial(
-        cpp.FactorGraph.gauss_newton, iter_threshold=SOLVER_TOLERANCE,
+        gauss_newton_solver, iter_threshold=SOLVER_TOLERANCE,
         verbose=SOLVER_VERBOSE, huber=config.huber, lm_lambda_init=config.lm_lambda_init),
+    GraphSolver.TRANSFORMER: _transformer_solve,
 }
 
 # How each field appears in a label, when it is one of the things that varies.
@@ -457,14 +483,15 @@ def run_variant(variant: Variant, scene: str, sequence, model, run) -> dict[str,
         # lambda and the previous cost across iterations; stepping one
         # iteration per C++ call (animate_solve) resets that every step, so
         # the batch path solves in one call, which is also 6 s faster per run.
-        if GRAPH_DELAY:
+        if GRAPH_DELAY and variant.graph_solver is GraphSolver.GAUSS_NEWTON:   # the animation steps GN
             # undamped on purpose: one iteration per call cannot carry LM's
             # state, and a rejected step reads as "converged" to the animation
             # (P006: 0.348 m damped-stepped vs 0.241 m either proper way)
             solve = lambda: animate_solve(world, run, track, huber=cfg.huber, lm_lambda_init=0.0)
         else:
             def solve():
-                world.optimize(variant.graph_function)   # calibrate, solve to SOLVER_TOLERANCE, rebuild the closure gate's chain
+                # calibrate (GN only: the transformer was trained on raw information), solve, rebuild the closure gate's chain
+                world.optimize(variant.graph_function, calibrate=variant.graph_solver is not GraphSolver.TRANSFORMER)
                 run.frame(np.array(world.factor_graph.poses())[:, :3, 3], track=track, x=1, x_label="iteration")
         _, failed = stage("optimize", solve)
         if not failed:

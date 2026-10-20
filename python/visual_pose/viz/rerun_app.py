@@ -9,6 +9,10 @@ are sent the first time its recording is opened.
 
 Enter in its terminal pauses loading new scenes and runs; Enter again resumes where it stopped.
 
+File > Open in the viewer adds scenes beyond SHOW: multi-select files in
+out/viewer/open/, one per scene. Needs a viewer this app spawned; see
+rerun_importer.py.
+
 A new data type needs only a Source; per-type extra layers go in EXTRAS.
 """
 from __future__ import annotations
@@ -16,6 +20,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import os
 import select
 import socket
 import sys
@@ -29,6 +34,7 @@ import numpy as np
 
 from visual_pose.data_utils.sources import SOURCES, HM3DSource, Source, source
 from visual_pose.viz import rerun_view as view
+from visual_pose.viz.rerun_importer import HANDLE_SUFFIX, HANDLES, REQUESTS
 from visual_pose.viz.run_log import DEFAULT_ROOT as RUNS_ROOT, SUFFIX, read_run_log
 
 PORT = 9876
@@ -43,13 +49,28 @@ HEAVY_SCENES = 3
 RECONCILE_GRACE_S = 10    # a recording this new may not be in viewer_state yet: not "closed by the viewer"
 
 # ===== EDIT ME: which keys to show. Globs over run.py's RUNS keys; "*" also
-# crosses "/", so "hm3d:00803-*" is every trajectory of that scene.
+# crosses "/", so "hm3d:00803-*" is every trajectory of that scene. Empty:
+# nothing until File > Open.
+SHOW = []
 # SHOW = ["*"]
-SHOW = ["hm3d:0080*", "hm3d:0081*", "hm3d:0082*", "bag:*"]
+# SHOW = ["hm3d:0080*", "hm3d:0081*", "hm3d:0082*", "bag:*"]
 # SHOW = ["hm3d:*/trajectory_0[0-9]"]
 # Source type -> (rec, src, renderer) -> info lines. The renderer is a SceneRenderer
 # for the source's scene, opened only for these.
 EXTRAS = {HM3DSource: view.log_hm3d_extras}
+
+
+def write_handles(keys) -> None:
+    """One file per scene (a key's part before "/") for File > Open to multi-select."""
+    groups = {}
+    for key in keys:
+        group = key.split("/")[0]
+        groups[group] = group if group == key else group + "/*"
+    HANDLES.mkdir(parents=True, exist_ok=True)
+    for old in HANDLES.glob(f"*{HANDLE_SUFFIX}"):
+        old.unlink()
+    for group, pattern in groups.items():
+        (HANDLES / f"{group.replace(':', '_')}{HANDLE_SUFFIX}").write_text(pattern + "\n")
 
 
 def first_record(path: Path) -> dict:
@@ -124,7 +145,10 @@ class App:
         if running:
             self.client = ViewerClient.connect(f"rerun+http://127.0.0.1:{port}/proxy")
             self.client.close_recordings("all")        # a restart re-sends everything
+            print("reusing a running viewer: File > Open adds scenes only if this app spawned it")
         else:
+            # the viewer finds importers on its PATH; inherited from here at spawn
+            os.environ["PATH"] = f"{Path(__file__).parent / 'bin'}{os.pathsep}{os.environ['PATH']}"
             # server_memory_limit is a replay buffer for viewers that connect later; there are
             # none (a restart re-sends everything), and at 1GiB it was a second copy of the data
             self.client = ViewerClient.spawn(port=port, memory_limit=VIEWER_MEMORY, server_memory_limit="0B",
@@ -141,6 +165,10 @@ class App:
         self._last = dict.fromkeys(("scan", "tail", "active"), 0.0)
         self.paused = False
         self.stdin = sys.stdin
+        self.show = list(SHOW)
+        REQUESTS.unlink(missing_ok=True)               # File > Open adds to this session only
+        self.requests_at = 0
+        write_handles(k for cls in sources for k in cls.discover())
 
     # -- recordings
 
@@ -255,9 +283,25 @@ class App:
     # -- discovery
 
     def _wanted(self, key: str) -> bool:
-        return any(fnmatch.fnmatchcase(key, p) for p in SHOW)
+        return any(fnmatch.fnmatchcase(key, p) for p in self.show)
+
+    def requests(self) -> None:
+        """Globs File > Open appended (rerun_importer)."""
+        try:
+            with REQUESTS.open("rb") as f:
+                f.seek(self.requests_at)
+                new = f.read()
+        except FileNotFoundError:
+            return
+        new = new[:new.rfind(b"\n") + 1]               # a line still being appended waits
+        self.requests_at += len(new)
+        for p in new.decode().splitlines():
+            if p not in self.show:
+                print(f"opened in the viewer: {p}")
+                self.show.append(p)
 
     def scan(self) -> None:
+        self.requests()
         for cls in self.sources:
             for key in filter(self._wanted, cls.discover()):
                 stamp = source(key).stamp()

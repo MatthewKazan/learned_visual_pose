@@ -19,8 +19,8 @@ import torch
 from torch import Tensor
 
 from visual_pose import _geometry as cpp
-from visual_pose.config import Config
-from visual_pose.data_utils.constants import code_version
+from visual_pose.config.config import Config
+from visual_pose.config.constants import code_version
 from visual_pose.geometry import relative_pose
 from visual_pose.models.global_descriptor import gem_pooling
 from visual_pose.pose_graph.world_model import WorldModel

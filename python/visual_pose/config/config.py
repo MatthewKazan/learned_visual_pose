@@ -1,7 +1,7 @@
 """
 Every tunable in one dataclass, with CLI flags generated from its fields.
 
-    python -m visual_pose.train --temperature 0.03 --norm group --run_name t03_gn
+    python -m visual_pose.training.train --temperature 0.03 --norm group --run_name t03_gn
 
 Written into each checkpoint, so a result is always traceable to what produced
 it, and a sweep is a command line rather than an edit.
@@ -10,7 +10,7 @@ from dataclasses import dataclass, fields, asdict, replace
 from pathlib import Path
 from typing import Optional
 
-from visual_pose.data_utils.constants import REPO_DIR
+from visual_pose.config.constants import REPO_DIR
 
 
 @dataclass
@@ -53,6 +53,13 @@ class Config:
     max_depth: float = 30.0
     occlusion_tol: float = 0.1 # FROZEN, changes very little
     jitter: float = 0.2
+    correspondence_pixel_border: int = 40
+    # Subtracted from every matched pixel (both images): the matcher's mean signed offset,
+    # PER CHECKPOINT -- fine_tuning prints it ("mean signed offset over inliers"). For
+    # fine_tuning_wide_baseline_3: straight-edge heading error +0.013 -> +0.005 deg/edge
+    # (159 edges, t 2.0 -> 0.8). _2 measured u +0.16, v +0.15.
+    match_offset_u: float = 0.14
+    match_offset_v: float = 0.12
 
     # ---- model ----
     # ~50 sweep trials on one proxy. Receptive field dominated everything else
@@ -306,11 +313,9 @@ class TransformerSolverConfig:
     # Sweep 2026-10-13 (out/sweep/summary.json, 8 epochs, 20-graph ATE median): batch 1 0.145
     # vs batch 2 0.154 at lr 1e-4 -- twice the optimizer steps per epoch.
     batch_size: int = 1
-    seed: int = 42
-    # Fraction of SCENES in train; the rest are val.
-    train_fraction: float = 0.8
+    seed: int = 42   # weight init and data order; the train/val split is constants.HM3D_SCENES
     points_per_keyframe: int = 64   # 64 / 128 / 256 all within noise; 64 peaks at 4.6 GB vs 19 GB at 256
-    use_descriptor: bool = False
+    use_descriptor: bool = True
 
     # AdamW, not the CNN's SGD 0.01: the usual transformer choice.
     optimizer: str = "adamw"
@@ -325,7 +330,7 @@ class TransformerSolverConfig:
     ate_eval_every: int = 2
     ate_eval_trajectories: int = 20
 
-    run_name: str = "transformer_best"   # where THIS run saves: checkpoints/<run_name>/
+    run_name: str = "full_G1_std"   # where THIS run saves: checkpoints/<run_name>/
     # best so far: checkpoints/sweep_final_lr1e4_b1_p64_e16/best.pt (this config, 16 epochs)
     starting_checkpoint: Optional[str] = None
     loss_trans_weight: float = 0.36
@@ -343,6 +348,49 @@ class TransformerSolverConfig:
     # False: random-depth no-grad passes + one trained pass (memory 1 pass). True: all passes
     # in the loss with gradients through them (memory ~refinement_iterations passes).
     refinement_backprop: bool = False
+    closure_dropout: float = 0.0
+    # Old tokenizer, for comparison and for loading checkpoints from before 2026-10-16: the
+    # positional encoding added to every point before pooling, scaled by a learned pe_scalar
+    # (init 0.1), instead of straight onto the vertex token; points left in the camera frame.
+    pe_in_geometry: bool = True
+    rotate_points: bool = False
+    # Each closure token also gets its residual Log(Z_ij^-1 T_i^-1 T_j) against the current poses (6 more
+    # inputs to embed_closure): the disagreement the model otherwise has to compute from the endpoints.
+    # Runs before 2026-10-19 do not have it.
+    closure_residual: bool = True
+    # Each closure token += MLP([closure, vertex_i, vertex_j]), the endpoint vertex tokens gathered by
+    # index (a graph-network edge update). Last layer zero-initialised: starts as the model without it.
+    closure_edge_mlp: bool = True
+    # The vertex tokens get zeros instead of each vertex's absolute pose (vertex-0 frame), so the
+    # trajectory's shape is only reachable through the edges. Test 2026-10-19: with poses, the model
+    # ran almost entirely on pose + sequence position, edges and their uncertainty barely used.
+    zero_pose_features: bool = False
+    # Odometry tokens also get their residual (as closure_residual). On chained odometry it is exactly 0;
+    # it carries information once the input poses are perturbed (pose_noise_*) or refined.
+    odometry_residual: bool = True
+    # TRAINING graphs only: each vertex's input pose (not vertex 0, the gauge anchor) right-perturbed by
+    # Exp of N(0, deg) rotation and N(0, m) translation, independently per vertex. The odometry edges are
+    # then the only way to undo it: a model that improves on noisy input must be using them.
+    # Edge -> vertex messages (graph-network node update): each vertex adds the mean of messages from
+    # its incident odometry edges and closures. E2 (2026-10-19): with only attention to route an
+    # edge's residual to its vertices, masking the edges changed nothing, even on noisy input.
+    edge_to_vertex: bool = True
+    # Multipliers on the residual's rho (translation, TRANSLATION_NORM units) and phi (rad) before
+    # the embedding. Measured on noisy (2 deg, 5 cm) eval graphs: std 0.0072 and 0.049, against the
+    # information log-diagonal at ~13 -- at 1.0 the residual is ~1/1000 of the token. 100 / 20 -> std ~1.
+    residual_scale_rho: float = 100.0
+    residual_scale_phi: float = 20.0
+    # Multiplier on the DINOv2 descriptors before embed_descriptor. They are unit 384-vectors (std ~0.04
+    # a component) against points in metres (std ~1): after embedding the descriptor term was 0.10-0.16
+    # of the point term, then LayerNorm-ed together. 25 -> std ~1 a component.
+    descriptor_scale: float = 25.0
+    pose_noise_deg: float = 2.0
+    pose_noise_m: float = 0.05
+    chordial_cap: float = 0.1
+    # Per-column (x - mean) / std on every embedding input, stats from this file (relative to the repo,
+    # measured by /tmp/featstats/measure.py on 300 training graphs). Overrides residual_scale_* and
+    # descriptor_scale (both treated as 1). None = off, as every run before 2026-10-20.
+    feature_stats: Optional[str] = "out/feature_stats.json"
 
     @property
     def checkpoint_dir(self) -> Path:

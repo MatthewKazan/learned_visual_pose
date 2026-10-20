@@ -21,8 +21,8 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
 
-from visual_pose.config import Config
-from visual_pose.data_utils.constants import DEVICE
+from visual_pose.config.config import Config
+from visual_pose.config.constants import DEVICE
 from visual_pose.data_utils.loaders import on_device
 from visual_pose.models.global_descriptor import gem_pooling
 from visual_pose.pose_graph.world_model import WorldModel

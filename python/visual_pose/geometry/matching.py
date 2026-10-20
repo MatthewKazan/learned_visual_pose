@@ -10,7 +10,7 @@ from torch import floor, nn, Tensor
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from visual_pose.data_utils.constants import DEVICE
+from visual_pose.config.constants import DEVICE
 from visual_pose.data_utils.loaders import on_device
 from visual_pose.geometry.best_match import best_match
 

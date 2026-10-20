@@ -11,7 +11,7 @@ import torch
 from torch import Tensor
 
 from visual_pose import _geometry as cpp
-from visual_pose.config import Config
+from visual_pose.config.config import Config
 from visual_pose.geometry.best_match import get_matching_pairs_batched
 from visual_pose.geometry.true_correspondences import (
     back_project, depth_at, in_image_mask, project, sample_pixel_grid, transform_points,
@@ -36,9 +36,13 @@ class KeyFrame:
 # Returns the fit, not just the pose, so the weight uses the same samples.
 RelativePoseFn = Callable[[np.ndarray, np.ndarray, Config], cpp.RansacFit | None]
 
+
+class WorldModel:
+    pass
+
 # Mutates graph.vertices and returns nothing; read the answer from poses().
 # Bind solver keywords with partial, so cpp.gauss_newton needs no wrapper.
-SolveFn = Callable[[cpp.FactorGraph], None]
+SolveFn = Callable[[WorldModel], None]
 
 
 class WorldModel:
@@ -56,6 +60,8 @@ class WorldModel:
         self._matches: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
         # sequence index -> vertex index; not all frames become keyframes
         self.vertex_index: dict[int, int] = {}
+        # per factor_graph edge, in insertion order: what the transformer splits closures from odometry by
+        self.edge_is_closure: list[bool] = []
         # The odometry chain, for gating closures against accumulated drift.
         # chain_links: (from frame, to frame, edge covariance in frame `to`) per
         # odometry edge in order; chain_prefix[k]: world-frame covariance of
@@ -133,16 +139,23 @@ class WorldModel:
             image_shape = self.keyframe(chunk[0][0]).rgb.shape[:2]     # (H, W); rgb is HWC
             matched = get_matching_pairs_batched(descriptors_i, descriptors_j, image_shape,
                                                  self.cfg.similarity_threshold)
+            offset = np.array([self.cfg.match_offset_u, self.cfg.match_offset_v])   # Config: per checkpoint
             for pair, (uv_i, uv_j) in zip(chunk, matched):
                 # torch -> numpy boundary; float64 because the C++ takes MatrixX3d
-                self._matches[pair] = (uv_i.cpu().numpy().astype(np.float64),
-                                       uv_j.cpu().numpy().astype(np.float64))
+                self._matches[pair] = (uv_i.cpu().numpy().astype(np.float64) - offset,
+                                       uv_j.cpu().numpy().astype(np.float64) - offset)
 
     def matches(self, seq_idx_i: int, seq_idx_j: int) -> tuple[np.ndarray, np.ndarray]:
         """(uv_i, uv_j) pixel matches, (K, 2) each; from the cache or matched now."""
         if (seq_idx_i, seq_idx_j) not in self._matches:
             self.prefetch_matches([(seq_idx_i, seq_idx_j)])
         return self._matches[(seq_idx_i, seq_idx_j)]
+
+    def within_usable_range(self, uv, H, W):
+        """(N,) bool: uv (N,2), possibly float, only allow pixels far from padding."""
+        u = uv[:, 0]
+        v = uv[:, 1]
+        return (u >= self.cfg.correspondence_pixel_border) & (u < W - self.cfg.correspondence_pixel_border) & (v >= self.cfg.correspondence_pixel_border) & (v < H - self.cfg.correspondence_pixel_border)
 
     def correspondences(self, seq_idx_i: int, seq_idx_j: int):
         """
@@ -157,7 +170,10 @@ class WorldModel:
         # not valid_depth_mask -- it re-indexes at integer uv and throws away
         # depth_at's subpixel interpolation
         mask = (usable_depth(depth_i, self.cfg.max_depth)
-                & usable_depth(depth_j, self.cfg.max_depth))
+                & usable_depth(depth_j, self.cfg.max_depth)
+                & self.within_usable_range(uv_i, self.depth(seq_idx_i).shape[0], self.depth(seq_idx_i).shape[1])
+                & self.within_usable_range(uv_j, self.depth(seq_idx_j).shape[0], self.depth(seq_idx_j).shape[1]))
+
         uv_i, uv_j = uv_i[mask], uv_j[mask]
         depth_i, depth_j = depth_i[mask], depth_j[mask]
 
@@ -294,6 +310,7 @@ class WorldModel:
             measurement,
             information,
         )
+        self.edge_is_closure.append(is_closure)
         if not is_closure:
             self.chain_links.append((seq_idx_i, seq_idx_j, np.linalg.inv(information)))
             self.chain_pos[seq_idx_j] = len(self.chain_prefix)
@@ -420,16 +437,19 @@ class WorldModel:
         d_squared = float(r @ np.linalg.solve(covariance, r))
         return d_squared <= self.cfg.closure_gate_threshold
 
-    def optimize(self, solve: SolveFn) -> np.ndarray | None:
+    def optimize(self, solve: SolveFn, calibrate: bool = True) -> np.ndarray | None:
         """
         Calibrate the weights, solve, return (N, 3) positions.
 
         Below two vertices there is nothing to solve and the solver raises.
+        calibrate=False for the transformer: it was trained on the raw information
+        (sample.npz), and calibration is GN's Huber scale, not a property of the edges.
         """
         if len(self.factor_graph.vertices) < 2:
             return None
-        self.calibrate()
-        solve(self.factor_graph)
+        if calibrate:
+            self.calibrate()
+        solve(self)
         self.rebuild_chain_covariance()
         return np.array(self.factor_graph.poses())[:, :3, 3]
 

@@ -34,7 +34,7 @@ from typing import Self
 
 import numpy as np
 
-from visual_pose.data_utils.constants import REPO_DIR
+from visual_pose.config.constants import REPO_DIR
 
 DEFAULT_ROOT = REPO_DIR / "out" / "runs"
 

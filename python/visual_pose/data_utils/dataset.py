@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from visual_pose.data_utils.constants import INTRINSICS_TARTAN_AIR
+from visual_pose.config.constants import INTRINSICS_TARTAN_AIR
 
 R_ned_cv = np.array([
     [0, 0, 1],

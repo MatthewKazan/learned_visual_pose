@@ -12,8 +12,8 @@ from torch import Tensor
 from torch.utils.data import DataLoader, ConcatDataset
 
 from visual_pose.data_utils.wide_baseline_CNN import WideBaselineDataset
-from visual_pose.config import Config, TransformerSolverConfig
-from visual_pose.data_utils.constants import DEVICE, REPO_DIR
+from visual_pose.config.config import Config, TransformerSolverConfig
+from visual_pose.config.constants import DEVICE, REPO_DIR
 from visual_pose.data_utils.dataset import FrameSequence, TartanAirSequence
 from visual_pose.data_utils.training_dataset_CNN import TACorrespondenceDataset
 
@@ -163,20 +163,18 @@ def build_loop_closure_probe_loader(cfg: Config = Config()) -> DataLoader:
     return DataLoader(LoopClosureTrajectories(keys=keys), batch_size=1, num_workers=2, persistent_workers=True)
 
 
-def split_trajectories(cfg: TransformerSolverConfig) -> tuple[list, list]:
+def split_trajectories() -> tuple[list, list]:
     """
-    Every trajectory with a pose graph, split (train, val) at random by SCENE,
-    cfg.train_fraction of the scenes to train: a scene's 10 trajectories share a
-    house, so splitting trajectories would put the same rooms on both sides.
-    Same cfg.seed, same split.
+    Every trajectory with a pose graph, split (train, val) by SCENE, following
+    constants.HM3D_SCENES' roles: a scene's trajectories share a house, so splitting
+    trajectories would put the same rooms on both sides.
     """
+    from visual_pose.data_utils.hm3d_sequence import scene_dirs
     from visual_pose.data_utils.pose_graph_samples import graph_dirs
+    val_scenes = set(scene_dirs("validation"))
     trajectories = graph_dirs()
-    scenes = sorted({t.parents[1] for t in trajectories})
-    np.random.default_rng(cfg.seed).shuffle(scenes)
-    train_scenes = set(scenes[:round(cfg.train_fraction * len(scenes))])
-    train = [t for t in trajectories if t.parents[1] in train_scenes]
-    val = [t for t in trajectories if t.parents[1] not in train_scenes]
+    train = [t for t in trajectories if t.parents[1] not in val_scenes]
+    val = [t for t in trajectories if t.parents[1] in val_scenes]
     return train, val
 
 
@@ -208,15 +206,18 @@ def collate_pose_graph_ds(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
 
 
 def build_transformer_loaders(cfg: TransformerSolverConfig) -> tuple[DataLoader, DataLoader]:
-    """(train_loader, val_loader) of PoseGraphDataset over split_trajectories(cfg).
+    """(train_loader, val_loader) of PoseGraphDataset over split_trajectories().
     Graphs differ in V, O and L, so batch_size > 1 needs a collate_fn that pads."""
     from visual_pose.data_utils.pose_graph_dataset import PoseGraphDataset
-    train, val = split_trajectories(cfg)
+    train, val = split_trajectories()
     loader = dict(batch_size=cfg.batch_size, collate_fn=collate_pose_graph_ds, num_workers=2, persistent_workers=True)
     # descriptors loaded exactly when the model uses them
-    ds = dict(pass_descriptor=cfg.use_descriptor, num_points=cfg.points_per_keyframe)
-    return (DataLoader(PoseGraphDataset(train, **ds), shuffle=True, **loader),
-            DataLoader(PoseGraphDataset(val, random_points=False, **ds), shuffle=False, **loader))
+    ds_val = dict(pass_descriptor=cfg.use_descriptor, num_points=cfg.points_per_keyframe, closure_dropout=0.0 if cfg.closure_dropout != 1.0 else 1.0)
+    ds_train = ds_val.copy()
+    ds_train['closure_dropout'] = cfg.closure_dropout
+    ds_train.update(pose_noise_deg=cfg.pose_noise_deg, pose_noise_m=cfg.pose_noise_m)   # training only: val stays comparable
+    return (DataLoader(PoseGraphDataset(train, **ds_train), shuffle=True, **loader),
+            DataLoader(PoseGraphDataset(val, random_points=False, **ds_val), shuffle=False, **loader))
 
 
 

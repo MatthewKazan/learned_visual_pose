@@ -14,13 +14,13 @@ from functools import partial
 
 from data_utils.loop_closure_dataset import LoopClosureDataset
 from data_utils.wide_baseline_CNN import WideBaselineDataset
-from visual_pose.checkpoints import load_cnn_model
-from visual_pose.config import Config
+from visual_pose.training.checkpoints import load_cnn_model
+from visual_pose.config.config import Config
 from visual_pose.data_utils.loaders import build_wide_baseline_loaders, build_loop_closure_loaders, \
     build_hm3d_wide_baseline_loaders
-from visual_pose.matching import mma, test_model
-from visual_pose.training import fit
-from visual_pose.training_CNN import cnn_evaluate, cnn_step
+from visual_pose.geometry.matching import mma, test_model
+from visual_pose.training.fit import fit
+from visual_pose.training.cnn import cnn_evaluate, cnn_step
 
 # The run whose best.pt seeds this one. Architecture fields in Config must match
 # its config.json or load_state_dict fails -- verified identical as of writing.
@@ -32,7 +32,7 @@ def main():
     # A fine-tune, not a retrain: 10x lower LR and a short schedule, so the
     # model adapts to the new pairs instead of relearning from them.
     cfg.learning_rate = 0.001
-    cfg.num_epochs = 3
+    cfg.num_epochs = 2
 
     # load from the pretrained run, save to a new one. checkpoint_dir is derived
     # from run_name, so the order matters -- reading before the rename would
@@ -40,9 +40,9 @@ def main():
     cfg.run_name = PRETRAINED_RUN
     model = load_cnn_model(cfg)
     print(f"initialised from {cfg.checkpoint_dir / 'best.pt'}")
-    cfg.run_name = "fine_tuning_wide_baseline_2"
+    cfg.run_name = "fine_tuning_wide_baseline_3"
 
-    train_loader, val_wide_loader, val_narrow_loader = build_hm3d_wide_baseline_loaders(cfg, train_trajectories=100, val_trajectories=20)
+    train_loader, val_wide_loader, val_narrow_loader = build_hm3d_wide_baseline_loaders(cfg, train_trajectories=20, val_trajectories=20)
 
     # Checkpoints on the wide metric. Narrow is the tripwire, not a target:
     # 5-frame pairs are what the odometry actually runs on.

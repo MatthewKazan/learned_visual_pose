@@ -2,7 +2,7 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 from typing import List
 
-from visual_pose.config import Config
+from visual_pose.config.config import Config
 
 
 class DescriptorCNN(nn.Module):
@@ -13,6 +13,7 @@ class DescriptorCNN(nn.Module):
         body_strides: list[int]      = [2, 2, 2],
         body_dilations: list[int]    = None,
         descriptor_dim: int = 128,
+        padding: bool = True,
         norm: str = "batch",
     ):
         super().__init__()
@@ -30,13 +31,14 @@ class DescriptorCNN(nn.Module):
         self.descriptor_dim = descriptor_dim
         self.body_channels = body_channels
         self.norm = norm
+        self.padding = padding
 
         # backbone: stem + body, all Conv → norm → ReLU
         blocks = []
         in_ch = 3   # RGB input
         for out_ch, k, s, d in zip(body_channels, body_kernel_sizes, body_strides, body_dilations):
             blocks.append(self._conv_block(in_ch, out_ch, kernel_size=k, stride=s,
-                                           dilation=d, norm=norm))
+                                           dilation=d, norm=norm, padding=padding))
             in_ch = out_ch
         self.backbone = nn.Sequential(*blocks)
 
@@ -45,7 +47,7 @@ class DescriptorCNN(nn.Module):
 
     @staticmethod
     def _conv_block(in_ch: int, out_ch: int, kernel_size: int, stride: int,
-                    dilation: int = 1, norm: str = "batch") -> nn.Sequential:
+                    dilation: int = 1, norm: str = "batch", padding: bool = False) -> nn.Sequential:
         # BatchNorm blends statistics across a shuffled multi-environment
         # batch; GroupNorm is per-sample and immune.
         if norm == "batch":
@@ -62,7 +64,7 @@ class DescriptorCNN(nn.Module):
         # conversion and reads as "the descriptor got worse".
         return nn.Sequential(
             nn.Conv2d(in_ch, out_ch, kernel_size, stride,
-                      padding=dilation * (kernel_size - 1) // 2, dilation=dilation),
+                      padding=dilation * (kernel_size - 1) // 2 if padding else 0, dilation=dilation),
             norm_layer,
             nn.ReLU(inplace=True),
         )

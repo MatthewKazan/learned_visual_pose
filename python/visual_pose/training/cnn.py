@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.utils.data import DataLoader
 
-from visual_pose.matching import descriptors_at, mma, test_model
+from visual_pose.geometry.matching import descriptors_at, mma, test_model
 
 
 def infoNCE_loss(sampled_i: Tensor, sampled_j: Tensor,

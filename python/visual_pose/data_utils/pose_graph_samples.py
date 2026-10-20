@@ -16,6 +16,15 @@ PoseGraphDataset trims them to its (V, 12) / (E, 33) features:
     odometry_ij, odometry_Z, odometry_info  as the closure arrays, (O, ...)
     vertex_frames  (V,)     sequence index of each vertex
     split                   "train" | "val", from graph.npz
+
+Beside it, from the descriptor pass (second half of __main__), float16:
+    descriptors_pvd.npy  (P,V,D)  DINOv2 patch descriptors read at each stored point. POINT-MAJOR
+    cls.npy              (V,D)    each keyframe's DINOv2 CLS token
+Raw .npy, not inside sample.npz: PoseGraphDataset memory-maps the descriptors and reads
+only the window of points it keeps (an .npz member can only be read whole: 120 MB a graph),
+and adding them never rewrites sample.npz. Point-major so that window, across every
+keyframe, is ONE contiguous block: on the USB hard disk (Seagate Portable, ~10 ms a seek)
+(V,P,D) costs a seek per keyframe, ~300 a graph, ~3 s -- slower than reading it all.
 """
 import argparse
 from multiprocessing import Pool, cpu_count
@@ -23,45 +32,37 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from scipy.spatial.transform import Rotation
 from torch import nn, Tensor
 
-from visual_pose.data_utils.constants import DEVICE
-from visual_pose.matching import bilinear_sample_descriptor
+from visual_pose import _geometry as cpp
+from visual_pose.config.constants import DEVICE
+from visual_pose.geometry.matching import bilinear_sample_descriptor
 from visual_pose.models.dino_v2 import SemanticDescriptor, PATCH
-from visual_pose.config import TransformerSolverConfig
+from visual_pose.config.config import TransformerSolverConfig
 from visual_pose.geometry.true_correspondences import back_project
 from visual_pose.data_utils.hm3d_sequence import POSES_FILE, scene_dirs, HM3DSequence
 from visual_pose.data_utils.sources import SavedHM3DFrames
 from visual_pose.pose_graph.frontend import GRAPH_FILE, GRAPH_SIDECAR
 
 SAMPLE_FILE = "sample.npz"
-_UPPER = np.triu_indices(6)
+DESCRIPTOR_FILE = "descriptors_pvd.npy"
+CLS_FILE = "cls.npy"
+OLD_DESCRIPTOR_FILE = "descriptors.npy"   # (V,P,D), briefly written 2026-10-15; split_out_descriptors converts it
 CFG = TransformerSolverConfig()
 DESCRIPTOR_BATCH_SIZE = 128
 
 
-def _pose(xyz_quat: list[float]) -> np.ndarray:
-    T = np.eye(4)
-    T[:3, :3] = Rotation.from_quat(xyz_quat[3:7]).as_matrix()   # g2o order: qx qy qz qw, as scipy
-    T[:3, 3] = xyz_quat[:3]
-    return T
-
-
-def read_g2o(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """(poses (V,4,4), edge_ij (E,2), Z (E,4,4), info (E,6,6)), edges in file order."""
-    poses, ij, Z, info = [], [], [], []
-    for line in path.read_text().splitlines():
-        tag, *rest = line.split()
-        if tag == "VERTEX_SE3:QUAT":
-            poses.append(_pose([float(x) for x in rest[1:8]]))
-        elif tag == "EDGE_SE3:QUAT":
-            ij.append((int(rest[0]), int(rest[1])))
-            Z.append(_pose([float(x) for x in rest[2:9]]))
-            I = np.zeros((6, 6))
-            I[_UPPER] = [float(x) for x in rest[9:30]]
-            info.append(I + np.triu(I, 1).T)
-    return np.array(poses), np.array(ij).reshape(-1, 2), np.array(Z).reshape(-1, 4, 4), np.array(info).reshape(-1, 6, 6)
+def graph_arrays(graph: cpp.FactorGraph) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    (poses (V,4,4), edge_ij (E,2), Z (E,4,4), info (E,6,6)), edges in insertion order. A graph in
+    memory (the live solver) or loaded from graph.g2o: on 230 saved graphs the loader matches the
+    old text parser to 1e-13 (poses) and exactly (info).
+    """
+    edges = graph.edges
+    return (np.array(graph.poses()).reshape(-1, 4, 4),
+            np.array([(e.from_index, e.to_index) for e in edges], dtype=np.int64).reshape(-1, 2),
+            np.array([e.measured_pose.matrix() for e in edges]).reshape(-1, 4, 4),
+            np.array([e.info_matrix for e in edges]).reshape(-1, 6, 6))
 
 
 def sample_points(frames: SavedHM3DFrames, frame: int, n: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
@@ -86,30 +87,50 @@ def relative_errors(ij: np.ndarray, Z: np.ndarray, gt: np.ndarray) -> tuple[np.n
     return np.degrees(np.arccos(cos)), np.linalg.norm(E[:, :3, 3], axis=1)
 
 
+def sample_arrays(graph: cpp.FactorGraph, edge_is_closure: np.ndarray, vertex_frames: np.ndarray, frames,
+                  points: int = CFG.num_point_samples, gt: np.ndarray | None = None) -> dict[str, np.ndarray]:
+    """
+    The sample.npz arrays (module docstring) for one unsolved graph; the training samples and the
+    live transformer solver both come through here. frames: anything with depth(frame) and K.
+    gt (V,4,4) adds the TARGET-ONLY arrays; without it (a live run) they are absent.
+    """
+    poses_in, ij, Z, info = graph_arrays(graph)
+    closure = np.asarray(edge_is_closure, dtype=bool)
+    rng = np.random.default_rng(0)   # same seed, same vertex order -> the same points every rebuild
+    pts, uvs = zip(*(sample_points(frames, int(f), points, rng) for f in vertex_frames))
+    data = dict(poses=poses_in, points=np.stack(pts, dtype=np.float32), uvs=np.stack(uvs, dtype=np.int64),
+                closures_ij=ij[closure], closures_Z=Z[closure], closure_info=info[closure],
+                odometry_ij=ij[~closure], odometry_Z=Z[~closure], odometry_info=info[~closure],
+                vertex_frames=np.asarray(vertex_frames))
+    if gt is not None:
+        data["gt_poses"] = np.linalg.inv(gt[0]) @ gt
+        data["closure_rot_err_deg"], data["closure_t_err_m"] = relative_errors(ij[closure], Z[closure], data["gt_poses"])
+    return data
+
+
 def build_sample(traj_dir: Path, points: int = CFG.num_point_samples) -> Path:
-    side = np.load(traj_dir / GRAPH_SIDECAR)
-    poses_in, ij, Z, info = read_g2o(traj_dir / GRAPH_FILE)
-    vertex_frames, n_odom = side["vertex_frames"], int(side["n_odometry"])
-    gt = side["gt_poses"]
-    gt = np.linalg.inv(gt[0]) @ gt
-    frames = SavedHM3DFrames(traj_dir)
-    rng = np.random.default_rng(0)
-    pts, uvs = [], []
-    for f in vertex_frames:
-        pt, uv = sample_points(frames, int(f), points, rng)
-        pts.append(pt)
-        uvs.append(uv)
-    pts, uvs = np.stack(pts, dtype=np.float32), np.stack(uvs, dtype=np.int64)
-    rot_err, t_err = relative_errors(ij[n_odom:], Z[n_odom:], gt)
+    with np.load(traj_dir / GRAPH_SIDECAR) as side:
+        vertex_frames, n_odom = side["vertex_frames"], int(side["n_odometry"])
+        gt, split = side["gt_poses"], side["split"] if "split" in side else np.array("None")
+    graph = cpp.FactorGraph(str(traj_dir / GRAPH_FILE))
+    data = sample_arrays(graph, np.arange(len(graph.edges)) >= n_odom, vertex_frames,
+                         SavedHM3DFrames(traj_dir), points, gt)
+    uvs = data["uvs"]
     out = traj_dir / SAMPLE_FILE
+    # Descriptors are read at uvs in each keyframe's rgb, so they outlive a new graph unless the
+    # keyframes moved (frontend bridging) -- rng(0) in vertex_frames order redraws the same uvs.
+    same_points = False
+    if out.exists():
+        with np.load(out) as old:
+            same_points = (np.array_equal(old["vertex_frames"], vertex_frames)
+                           and np.array_equal(old["uvs"], uvs))
     tmp = out.with_name(f".{SAMPLE_FILE}")
     with open(tmp, "wb") as f:
-        np.savez(f, poses=poses_in, gt_poses=gt, points=pts, uvs=uvs,
-                 closures_ij=ij[n_odom:], closures_Z=Z[n_odom:], closure_info=info[n_odom:],
-                 closure_rot_err_deg=rot_err, closure_t_err_m=t_err,
-                 odometry_ij=ij[:n_odom], odometry_Z=Z[:n_odom], odometry_info=info[:n_odom],
-                 vertex_frames=vertex_frames, split=side["split"] if "split" in side else np.array("None"))
+        np.savez(f, **data, split=split)
     tmp.replace(out)
+    if not same_points:
+        for name in (DESCRIPTOR_FILE, OLD_DESCRIPTOR_FILE, CLS_FILE):   # sampled at the old points
+            (traj_dir / name).unlink(missing_ok=True)
     return out
 
 
@@ -132,34 +153,62 @@ def graph_dirs() -> list[Path]:
             if (d / POSES_FILE).exists() and (d / GRAPH_FILE).exists()]
 
 
-def save_descriptors(descriptors: torch.Tensor, traj: Path) -> None:
-    """Adds descriptors (V, P, D) float16 to traj's sample.npz, rewriting it."""
+def _save_npy(path: Path, array: np.ndarray) -> None:
+    """Via a temp name and rename: an interrupted write leaves the old file or none, never half of one."""
+    tmp = path.with_name(f".{path.name}")
+    with open(tmp, "wb") as f:
+        np.save(f, array)
+    tmp.replace(path)
+
+
+def save_descriptors(descriptors: np.ndarray, cls: np.ndarray, traj: Path) -> None:
+    """descriptors (V, P, D), stored transposed to (P, V, D), and cls (V, D), float16, beside sample.npz."""
+    _save_npy(traj / CLS_FILE, cls.astype(np.float16))
+    _save_npy(traj / DESCRIPTOR_FILE, np.ascontiguousarray(descriptors.transpose(1, 0, 2)).astype(np.float16))
+
+
+def split_out_descriptors(traj: Path) -> None:
+    """
+    Old layouts -> new, no GPU: descriptors and cls inside sample.npz, or a (V,P,D)
+    OLD_DESCRIPTOR_FILE, become DESCRIPTOR_FILE / CLS_FILE. Descriptors without cls are
+    only dropped -- the descriptor pass recomputes both.
+    """
+    old = traj / OLD_DESCRIPTOR_FILE
+    if old.exists():
+        if (traj / CLS_FILE).exists():
+            save_descriptors(np.load(old), np.load(traj / CLS_FILE), traj)
+        old.unlink()
     with np.load(traj / SAMPLE_FILE) as data:
-        data_dict = dict(data)
-    data_dict['descriptors'] = descriptors.cpu().numpy().astype(np.float16)
-    np.savez(traj / SAMPLE_FILE, **data_dict)
+        if 'descriptors' not in data:
+            return
+        if 'cls' in data:
+            save_descriptors(data['descriptors'], data['cls'], traj)
+        rest = {k: data[k] for k in data.files if k not in ('descriptors', 'cls')}
+    out = traj / SAMPLE_FILE
+    tmp = out.with_name(f".{SAMPLE_FILE}")
+    with open(tmp, "wb") as f:
+        np.savez(f, **rest)
+    tmp.replace(out)
+
+
+def descriptors_at(frames, vertex_frames: np.ndarray, descriptor_model, uvs: Tensor,
+                   batch_size: int = DESCRIPTOR_BATCH_SIZE) -> tuple[Tensor, Tensor]:
+    """
+    descriptor_model's map read at pixels uvs (V, P, 2) of each vertex's rgb: (V, P, D), and each
+    keyframe's CLS (V, D), float32 on the CPU. The descriptor pass and the live transformer
+    solver both come through here. frames: anything with rgb(frame).
+    """
+    rgb = np.stack([frames.rgb(int(i)) for i in vertex_frames])          # (V, H, W, 3) uint8: 1 GB, not 4
+    return descriptor_model.descriptors_for_images(torch.from_numpy(rgb), uvs, batch_size)
+
 
 def save_descriptors_at(seq: SavedHM3DFrames, descriptor_model, uvs: Tensor,
-                     batch_size: int = 128) -> None:
-    """descriptor_model's map read at each stored point's pixel uvs (V, P, 2): (V, P, D) into sample.npz."""
+                     batch_size: int = DESCRIPTOR_BATCH_SIZE) -> None:
+    """descriptors_at every stored point (uvs (V, P, 2)), saved by save_descriptors."""
     with np.load(seq.dir / GRAPH_SIDECAR) as side:
         kfs = side["vertex_frames"]
-    rgb = np.stack([seq.rgb(int(i)) for i in kfs])          # (N, H, W, 3) uint8: 1 GB, not 4
-    H, W = rgb.shape[-3:-1]
-    h, w = H - H % PATCH, W - W % PATCH
-    top, left = (H - h) // 2, (W - w) // 2
-    descriptors = []
-    with torch.inference_mode():
-        for b in range(0, len(rgb), batch_size):
-            x = torch.from_numpy(rgb[b:b + batch_size]).to(DEVICE).permute(0, 3, 1, 2).float().div_(255)
-            raw_descriptors = descriptor_model(x)
-            batch_uvs = uvs[b:b + batch_size]
-            feature_uvs = torch.stack([
-                ((batch_uvs[..., 0] - left) + 0.5) * (raw_descriptors.shape[3] / w) - 0.5,
-                ((batch_uvs[..., 1] - top) + 0.5) * (raw_descriptors.shape[2] / h) - 0.5,
-            ], dim=-1)
-            descriptors.append(bilinear_sample_descriptor(raw_descriptors, feature_uvs).cpu())
-    save_descriptors(torch.concat(descriptors), seq.dir)
+    descriptors, cls = descriptors_at(seq, kfs, descriptor_model, uvs, batch_size)
+    save_descriptors(descriptors.numpy(), cls.numpy(), seq.dir)
 
 
 if __name__ == "__main__":
@@ -178,13 +227,13 @@ if __name__ == "__main__":
         if n % 50 == 0 or n == len(trajs):
             print(f"descriptors {n}/{len(trajs)}", flush=True)
         try:
-            seq = SavedHM3DFrames(traj)
+            split_out_descriptors(traj)
+            if (traj / DESCRIPTOR_FILE).exists() and (traj / CLS_FILE).exists() and not args.overwrite:
+                continue
             with np.load(traj / SAMPLE_FILE) as data:
-                if len(data.get('descriptors', [])) == len(data['points']) and not args.overwrite:
-                    continue
                 uvs = torch.from_numpy(data['uvs']).int().to(DEVICE)
-                save_descriptors_at(seq, descriptor_model, uvs)
-                torch.accelerator.empty_cache()
+            save_descriptors_at(SavedHM3DFrames(traj), descriptor_model, uvs)
+            torch.accelerator.empty_cache()
         except Exception as e:
             print(f"FAILED {traj}: {e}", flush=True)
 

@@ -17,17 +17,17 @@ import torch
 from torch import nn
 
 from visual_pose import _geometry as cpp
-from visual_pose.config import TransformerSolverConfig
-from visual_pose.data_utils.constants import REPO_DIR
+from visual_pose.config.config import TransformerSolverConfig
+from visual_pose.config.constants import REPO_DIR
 from visual_pose.data_utils.loaders import collate_pose_graph_ds, split_trajectories
 from visual_pose.data_utils.pose_graph_dataset import PoseGraphDataset
 from visual_pose.data_utils.pose_graph_samples import SAMPLE_FILE
 from visual_pose.evaluation import metrics
 
 
-def eval_subset(cfg: TransformerSolverConfig, n: int) -> list[Path]:
-    """The first n val trajectories of split_trajectories(cfg), path-sorted. The ONE definition of the subset."""
-    return sorted(split_trajectories(cfg)[1])[:n]
+def eval_subset(n: int) -> list[Path]:
+    """The first n val trajectories of split_trajectories(), path-sorted. The ONE definition of the subset."""
+    return sorted(split_trajectories()[1])[:n]
 
 
 def trajectory_key(traj_dir: Path) -> str:
@@ -63,17 +63,37 @@ def correction(delta: np.ndarray) -> np.ndarray:
 
 
 @torch.no_grad()
+def refine(model: nn.Module, batch: dict, T_in: np.ndarray, cfg: TransformerSolverConfig) -> tuple[np.ndarray, float]:
+    """
+    (V,4,4) poses after cfg.refinement_iterations passes, as trans_step: T_i <- T_i correction(delta_i)
+    (right perturbation), the model re-run on the updated poses. batch is one collated graph on the
+    model's device; its poses are overwritten. Also the largest |delta| seen. Shared by the ATE
+    evaluation and the live solver (pose_graph/solvers.py).
+    """
+    from visual_pose.training.transformer_solver import model_input
+    V = len(T_in)
+    T, delta_max = T_in, 0.0
+    for _ in range(cfg.refinement_iterations):
+        delta = model(**model_input(batch, cfg.rotate_points))[0, :V].cpu().double().numpy()
+        T = np.stack([T[v] @ correction(delta[v]) for v in range(V)])
+        # model sees the float32 of the float64 T; trans_step compounds in float32 instead
+        batch["poses"][0, :V] = torch.from_numpy(T[:, :3].reshape(V, 12)).to(batch["poses"])
+        delta_max = max(delta_max, float(np.abs(delta).max()))
+    return T, delta_max
+
+
+@torch.no_grad()
 def transformer_ate(model: nn.Module, trajectories: list[Path], cfg: TransformerSolverConfig,
                     device: torch.device) -> dict:
     """
-    Per trajectory, cfg.refinement_iterations times as trans_step does: T_i <- T_i correction(delta_i)
-    (right perturbation), the model re-run on the updated poses; then scored against gt. T_in
-    and gt come from sample.npz in float64, not the dataset's float32 features, so delta = 0
-    reproduces the odometry ATE exactly.
+    Per trajectory, refine()'s poses scored against gt. T_in and gt come from sample.npz in
+    float64, not the dataset's float32 features, so delta = 0 reproduces the odometry ATE exactly.
     """
-    from visual_pose.training_transformer_solver import MODEL_INPUTS
+    # closures as build_transformer_loaders' val set: none for a closure_dropout = 1.0 model,
+    # which never trained its closure embedding, all of them otherwise
     ds = PoseGraphDataset(trajectories, pass_descriptor=cfg.use_descriptor,
-                          num_points=cfg.points_per_keyframe, random_points=False)
+                          num_points=cfg.points_per_keyframe, random_points=False,
+                          closure_dropout=1.0 if cfg.closure_dropout == 1.0 else 0.0)
     was_training = model.training
     model.eval()
     per = {}
@@ -83,15 +103,8 @@ def transformer_ate(model: nn.Module, trajectories: list[Path], cfg: Transformer
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             with np.load(traj / SAMPLE_FILE) as data:
                 T_in, T_gt = data["poses"], data["gt_poses"]
-            V = len(T_in)
-            T, delta_max = T_in, 0.0
-            for _ in range(cfg.refinement_iterations):
-                delta = model(**{k: batch[k] for k in MODEL_INPUTS})[0, :V].cpu().double().numpy()
-                T = np.stack([T[v] @ correction(delta[v]) for v in range(V)])
-                # model sees the float32 of the float64 T; trans_step compounds in float32 instead
-                batch["poses"][0, :V] = torch.from_numpy(T[:, :3].reshape(V, 12)).to(batch["poses"])
-                delta_max = max(delta_max, float(np.abs(delta).max()))
-            per[trajectory_key(traj)] = {"V": V, **ates(T, T_gt), "delta_max": delta_max}
+            T, delta_max = refine(model, batch, T_in, cfg)
+            per[trajectory_key(traj)] = {"V": len(T_in), **ates(T, T_gt), "delta_max": delta_max}
     finally:
         model.train(was_training)
     return {"per_trajectory": per, **summarise(per, ["ate", "ate_aligned"])}
@@ -112,7 +125,7 @@ def compare_line(result: dict, baseline: dict | None) -> str:
 
 def ate_epoch_hook(model: nn.Module, cfg: TransformerSolverConfig):
     """fit's on_epoch_end(epoch, value): every cfg.ate_eval_every epochs, transformer vs cached GN."""
-    trajectories = eval_subset(cfg, cfg.ate_eval_trajectories)
+    trajectories = eval_subset(cfg.ate_eval_trajectories)
     path = baseline_path(cfg.ate_eval_trajectories)
     baseline = json.loads(path.read_text()) if path.exists() else None
     if baseline is None:
@@ -120,7 +133,7 @@ def ate_epoch_hook(model: nn.Module, cfg: TransformerSolverConfig):
               f"`PYTHONPATH=python:python/visual_pose:. .venv/bin/python experiments/gn_baseline.py "
               f"--n {cfg.ate_eval_trajectories}`; reporting the transformer alone")
     elif baseline["trajectories"] != [trajectory_key(t) for t in trajectories]:
-        print(f"[ate] WARNING: {path} was computed on a different subset (seed/split changed?); "
+        print(f"[ate] WARNING: {path} was computed on a different subset (HM3D_SCENES changed?); "
               "its numbers are not comparable")
 
     def hook(epoch: int, value: float) -> None:

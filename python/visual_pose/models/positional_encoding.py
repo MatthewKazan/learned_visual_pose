@@ -3,7 +3,7 @@ import math
 
 from torch import nn
 
-from visual_pose.data_utils.constants import DEVICE
+from visual_pose.config.constants import DEVICE
 
 
 def positional_encoding_2d(h, w, d_dim, device = DEVICE):

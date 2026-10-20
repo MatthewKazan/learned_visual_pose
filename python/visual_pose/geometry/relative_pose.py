@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 
 from visual_pose import _geometry as cpp
-from visual_pose.config import Config
+from visual_pose.config.config import Config
 
 
 def kabsch(P_i: np.ndarray, P_j: np.ndarray, cfg: Config) -> cpp.RansacFit | None:

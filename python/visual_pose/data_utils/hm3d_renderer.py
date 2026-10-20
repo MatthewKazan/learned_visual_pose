@@ -1,8 +1,10 @@
 """
 HM3D trajectory generator: random walks on the navmesh, rendered by habitat-sim.
 
-    .venv/bin/python -m visual_pose.data_utils.hm3d_renderer                 # every scene in the active splits, TRAJ_PER_SCENE each
-    .venv/bin/python -m visual_pose.data_utils.hm3d_renderer --scenes 00801-HaxA7YrQdEC --per-scene 2 --descriptors
+    .venv/bin/python -m visual_pose.data_utils.hm3d_renderer
+
+No CLI: edit the run constants below the imports. Which scenes and how many
+trajectories each come from constants.HM3D_SCENES / HM3D_TRAJECTORIES_PER_SCENE.
 
 Each trajectory is a directory <scene>/trajectories/trajectory_NN/ holding
     poses.txt          one T_WC per line (16 numbers, row-major), habitat axes, eye height included
@@ -10,15 +12,12 @@ Each trajectory is a directory <scene>/trajectories/trajectory_NN/ holding
     meta.json          how it was made: seed, navmesh agent, budgets, generator commit
     rgb/NNNNNN.jpg     RGB of frame NNNNNN of poses.txt, JPEG q95
     depth/NNNNNN.png   its depth, uint16 millimetres, 0 = no return
-    descriptors.npy    with --descriptors: SemanticDescriptor output per frame, float16
+    descriptors.npy    with DESCRIPTORS: SemanticDescriptor output per frame, float16
     graph.g2o          the frontend's unsolved pose graph on the saved frames; graph.npz beside it holds the
                        vertex->frame map, ground truth and candidates (pose_graph/frontend.save_graph)
-
-    --overwrite        write trajectory_00.. in order, replacing each one that exists
-    --graph-only       no rendering: add the graph to the trajectories already on disk
 """
-import argparse
 import json
+import random
 import shutil
 import time
 from collections.abc import Callable, Sequence
@@ -31,18 +30,24 @@ import quaternion
 import torch
 
 from visual_pose.app.run import COMMON
-from visual_pose.checkpoints import load_cnn_model
-from visual_pose.config import Config
-from visual_pose.data_utils.hm3d_sequence import HM3DSequence, IMAGE_SIZE, POSES_FILE, scene_dir, scene_dirs, simulator_config
-from visual_pose.data_utils.constants import DEVICE, code_version
+from visual_pose.training.checkpoints import load_cnn_model
+from visual_pose.config.config import Config
+from visual_pose.data_utils.hm3d_sequence import HM3DSequence, IMAGE_SIZE, POSES_FILE, scene_dirs, simulator_config
+from visual_pose.config.constants import DEVICE, HM3D_SCENES, HM3D_TRAJECTORIES_PER_SCENE, code_version
 from visual_pose.data_utils.loop_closure_dataset import split_of
 from visual_pose.data_utils.sources import HM3DSource, SavedHM3DFrames
-from visual_pose.pose_graph.frontend import EdgeSolver, Variant, build, has_graph, save_graph
+from dataclasses import asdict
+from visual_pose.pose_graph.frontend import GRAPH_SIDECAR, EdgeSolver, Variant, build, has_graph, save_graph
 from visual_pose import _geometry as cpp
 
-TRAJ_PER_SCENE = 10
-OVERWRITE = True     # write trajectory_00.. in order, replacing each one that exists; else append after the last
-GRAPH_ONLY = True    # skip rendering; build the graph for existing trajectories (those without one, or all with OVERWRITE)
+# ===== run constants =====
+SCENES = "00[2-7]*"        # glob on the scene folder name, as run.hm3d: "000*" = 00000-00099, "00853-*" = one scene
+OVERWRITE = False    # write trajectory_00.. in order, replacing each one that exists; else top each scene up to its count
+GRAPH_ONLY = False   # skip rendering; build the graph for existing trajectories (those without one or built with another frontend config, or all with OVERWRITE)
+DESCRIPTORS = False  # also write descriptors.npy (frozen DINOv2, per frame; NOT what sample.npz uses)
+NO_GRAPH = False     # render only
+OUT: Path | None = None   # write under OUT/<scene>/trajectories instead of the scene directory
+SEED = 0             # trajectory k of scene number n gets SEED + 100 n + k
 # The frontend that builds each trajectory's graph
 GRAPH_VARIANT = COMMON[0]
 PATH_ANCHORS = 10
@@ -173,7 +178,7 @@ def pose_matrix_from_position_heading(p: np.ndarray, h: np.ndarray) -> np.ndarra
     T_WC[:3, 2] = z_axis
     T_WC[:3, 3] = p
 
-    T_WC[1, 3] += EYE_HEIGHT_M
+    T_WC[1, 3] += EYE_HEIGHT_M + (random.random() - 0.5)
 
     return T_WC
 
@@ -469,6 +474,14 @@ def build_graph(traj_dir: Path, model) -> dict:
     return summary
 
 
+def graph_is_current(traj_dir: Path) -> bool:
+    """A graph exists and its sidecar's frontend config is GRAPH_VARIANT's (save_graph stores it)."""
+    if not has_graph(traj_dir):
+        return False
+    with np.load(traj_dir / GRAPH_SIDECAR) as side:
+        return str(side["config"]) == json.dumps(asdict(GRAPH_VARIANT.config))
+
+
 def graph_model():
     """The descriptor CNN GRAPH_VARIANT names, loaded once per process."""
     model = load_cnn_model(GRAPH_VARIANT.config).eval()
@@ -481,43 +494,41 @@ def graph_summary(scene: Path, traj_dir: Path, summary: dict) -> str:
             f"{summary['odometry_edges']} odometry edges, {summary['closures']}/{summary['candidates']} closures")
 
 
-def main(argv: list[str] | None = None) -> None:
-    """--per-scene trajectories for each of --scenes, by default every scene in the active HM3D splits."""
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--scenes", nargs="*", help="scene directory names; default: every scene in constants.HM3D_ACTIVE")
-    ap.add_argument("--per-scene", type=int, default=TRAJ_PER_SCENE)
-    ap.add_argument("--seed", type=int, default=0, help="trajectory k of scene s gets seed + 100*s + k")
-    ap.add_argument("--out", type=Path, help="write under OUT/trajectories instead of the scene directory")
-    ap.add_argument("--descriptors", action="store_true", help="also write descriptors.npy (frozen DINOv2, models/dino_v2.py)")
-    ap.add_argument("--no-graph", action="store_true", help="render only; no graph")
-    ap.add_argument("--overwrite", action="store_true", default=OVERWRITE,
-                    help="write trajectory_00..(per-scene - 1), replacing each as it goes (with --graph-only: rebuild graphs that exist)")
-    ap.add_argument("--graph-only", action="store_true", default=GRAPH_ONLY,
-                    help="no rendering: build the graph for the trajectories on disk that lack one")
-    args = ap.parse_args(argv)
-
-    scenes = [scene_dir(n) for n in args.scenes] if args.scenes else scene_dirs()
+def main() -> None:
+    """Every scene of every role in HM3D_SCENES matching SCENES, HM3D_TRAJECTORIES_PER_SCENE[role] trajectories each."""
+    scenes = [(scene, HM3D_TRAJECTORIES_PER_SCENE[role]) for role in HM3D_SCENES
+              for scene in scene_dirs(role, SCENES)]
+    print(f"{len(scenes)} scenes", flush=True)
     descriptor = None
-    if args.descriptors and not args.graph_only:
+    if DESCRIPTORS and not GRAPH_ONLY:
         from visual_pose.models.dino_v2 import SemanticDescriptor   # torch.hub download and GPU: only when asked
         descriptor = SemanticDescriptor()
-    model = None if args.no_graph else graph_model()
+    model = None if NO_GRAPH else graph_model()
 
-    if args.graph_only:
-        for scene in scenes:
-            root = (args.out / scene.name if args.out else scene) / "trajectories"
+    if GRAPH_ONLY:
+        for scene, _ in scenes:
+            root = (OUT / scene.name if OUT else scene) / "trajectories"
             for traj_dir in sorted(d for d in root.glob("trajectory_*") if (d / POSES_FILE).exists()):
-                if has_graph(traj_dir) and not args.overwrite:
+                if graph_is_current(traj_dir) and not OVERWRITE:
                     continue
                 print(graph_summary(scene, traj_dir, build_graph(traj_dir, model)), flush=True)
         return
 
-    for s, scene in enumerate(scenes):
-        renderer = SceneRenderer(scene, seed=args.seed + 100 * s)
+    for scene, per_scene in scenes:
+        # Seeded by scene NUMBER, not list position, so SCENES cannot change a scene's paths.
+        # (The val scenes rendered before this used SEED + 100 * position; they are left as they are.)
+        n = int(scene.name[:5])
+        # Without OVERWRITE a rerun tops each scene up to per_scene rather than appending
+        # another per_scene: the scene list includes scenes rendered long ago.
+        done = 0 if OVERWRITE else len(list(
+            ((OUT / scene.name if OUT else scene) / "trajectories").glob(f"trajectory_*/{POSES_FILE}")))
+        if done >= per_scene:
+            continue
+        renderer = SceneRenderer(scene, seed=SEED + 100 * n)
         try:
-            for k in range(args.per_scene):
-                traj_dir = generate(renderer, args.seed + 100 * s + k, descriptor, args.out and args.out / scene.name, model,
-                                    index=k if args.overwrite else None)
+            for k in range(done, per_scene):
+                traj_dir = generate(renderer, SEED + 100 * n + k, descriptor, OUT and OUT / scene.name, model,
+                                    index=k if OVERWRITE else None)
                 meta = json.loads((traj_dir / "meta.json").read_text())
                 print(f"{scene.name}/{traj_dir.name}: {meta['poses']} frames, coverage {meta['coverage_m2']} of {meta['navmesh']['island_area_m2']:.0f} m2, "
                       f"near-wall frames {len(meta['near_wall']['frames'])}, redraws {meta['redraws']}"

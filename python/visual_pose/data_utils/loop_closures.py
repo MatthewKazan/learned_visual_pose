@@ -6,8 +6,8 @@ from pathlib import Path
 
 import numpy as np
 
-from visual_pose.config import Config
-from visual_pose.data_utils.constants import REPO_DIR
+from visual_pose.config.config import Config
+from visual_pose.config.constants import REPO_DIR
 from visual_pose.data_utils.dataset import FrameSequence
 from visual_pose.geometry.true_correspondences import generate_correspondences
 

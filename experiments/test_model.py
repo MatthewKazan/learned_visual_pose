@@ -1,13 +1,13 @@
 from torch.utils.data import DataLoader
 
-from visual_pose.matching import test_model
-from visual_pose.config import Config
+from visual_pose.geometry.matching import test_model
+from visual_pose.config.config import Config
 from visual_pose.models.descriptor_cnn import DescriptorCNN
 from visual_pose.models.sift import SIFT
-from visual_pose.data_utils.constants import DEVICE, REPO_DIR
+from visual_pose.config.constants import DEVICE, REPO_DIR
 from visual_pose.data_utils.training_dataset_CNN import TACorrespondenceDataset
 from visual_pose.data_utils.dataset import TartanAirSequence
-from visual_pose.checkpoints import load_cnn_model
+from visual_pose.training.checkpoints import load_cnn_model
 from visual_pose.data_utils.loaders import build_wide_baseline_loaders
 
 

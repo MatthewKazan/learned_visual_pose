@@ -7,7 +7,7 @@ from torchvision.transforms import ColorJitter
 
 from visual_pose.data_utils.dataset import TartanAirSequence
 from visual_pose.geometry.true_correspondences import generate_correspondences
-from visual_pose.data_utils.constants import INTRINSICS_TARTAN_AIR, REPO_DIR
+from visual_pose.config.constants import INTRINSICS_TARTAN_AIR, REPO_DIR
 
 
 class TACorrespondenceDataset(Dataset):
@@ -44,6 +44,9 @@ class TACorrespondenceDataset(Dataset):
         # Photometric jitter only
         self.jitter = ColorJitter(brightness=jitter, contrast=jitter,
                                   saturation=jitter, hue=jitter / 8) if augment else None
+        # Mirrors the whole pair, labels included. The matcher had a left-right pull: +0.023 deg
+        # heading per straight edge, sign flipping under a mirror (t ~ 6, 159 edges).
+        self.reflect = augment
 
         # candidate pairs (i, i + gap). Several gaps multiplies the pair count
         # from the same frames and spans a range of baselines, so the model sees
@@ -100,6 +103,12 @@ class TACorrespondenceDataset(Dataset):
         if self.jitter is not None:
             img_i = self.jitter(img_i)
             img_j = self.jitter(img_j)   # separate draw, deliberately
+        # one draw for both images: flipped independently, a pair stops showing one world
+        if self.reflect and torch.rand(()) < 0.5:
+            img_i, img_j = img_i.flip(-1), img_j.flip(-1)
+            W = img_i.shape[-1]
+            uv_i[:, 0] = W - 1 - uv_i[:, 0]   # pixel centres at integers, so the mirror axis is (W-1)/2
+            uv_j[:, 0] = W - 1 - uv_j[:, 0]
 
         uv_i = uv_i[~too_dark_mask]
         uv_j = uv_j[~too_dark_mask]

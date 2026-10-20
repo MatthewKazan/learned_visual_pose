@@ -19,9 +19,9 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader
 
-from visual_pose.checkpoints import save_checkpoint
-from visual_pose.config import TrainSettings
-from visual_pose.data_utils.constants import DEVICE
+from visual_pose.training.checkpoints import save_checkpoint
+from visual_pose.config.config import TrainSettings
+from visual_pose.config.constants import DEVICE
 from visual_pose.data_utils.loaders import on_device
 
 MAX_SKIPPED_STEPS = 5   # consecutive non-finite gradients before fit gives up
@@ -113,7 +113,7 @@ def fit(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader,
                 optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                # MPS has returned NaN gradients from finite inputs (training_aggregator);
+                # MPS has returned NaN gradients from finite inputs (training/aggregator.py);
                 # skipping that step keeps the weights clean, a run of them means a real bug
                 if not all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None):
                     skipped += 1

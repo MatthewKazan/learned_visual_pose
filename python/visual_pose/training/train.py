@@ -1,8 +1,8 @@
 """
-Training entrypoint. Every tunable lives in visual_pose.config.Config.
+Training entrypoint. Every tunable lives in visual_pose.config.config.Config.
 
-    python -m visual_pose.train
-    python -m visual_pose.train --config-json overrides.json
+    python -m visual_pose.training.train
+    python -m visual_pose.training.train --config-json overrides.json
 """
 import argparse
 import json
@@ -12,18 +12,18 @@ from pathlib import Path
 
 import torch
 
-from visual_pose.checkpoints import load_cnn_model
-from visual_pose.config import Config, TransformerSolverConfig
+from visual_pose.training.checkpoints import load_cnn_model
+from visual_pose.config.config import Config, TransformerSolverConfig
 from visual_pose.data_utils.loaders import (build_loaders, build_loop_closure_probe_loader,
                                             build_loop_closure_trajectory_loaders, build_transformer_loaders)
 from visual_pose.models.descriptor_cnn import DescriptorCNN
 from visual_pose.models.global_descriptor import AttentionPooling2d
 from visual_pose.models.transformer_solver.transformer import TransformerSolver
-from visual_pose.training import fit
-from visual_pose.training_CNN import cnn_evaluate, cnn_step
-from visual_pose.training_aggregator import (SigmoidScaled, aggregator_evaluate, aggregator_sigmoid_step,
+from visual_pose.training.fit import fit
+from visual_pose.training.cnn import cnn_evaluate, cnn_step
+from visual_pose.training.aggregator import (SigmoidScaled, aggregator_evaluate, aggregator_sigmoid_step,
                                              aggregator_step)
-from visual_pose.training_transformer_solver import trans_evaluate, trans_step
+from visual_pose.training.transformer_solver import trans_evaluate, trans_step
 
 
 def train_cnn(cfg: Config) -> None:
@@ -39,7 +39,7 @@ def train_cnn(cfg: Config) -> None:
 
 
 def train_atn_pooling(cfg: Config) -> None:
-    """AttentionPooling over the frozen CNN's descriptor map; step and evaluate are in training_aggregator."""
+    """AttentionPooling over the frozen CNN's descriptor map; step and evaluate are in training/aggregator.py."""
     torch.manual_seed(cfg.seed)
     train_loader, val_loader = build_loop_closure_trajectory_loaders(cfg)
     cnn = load_cnn_model(replace(cfg, run_name=cfg.aggregator_frozen_cnn)).eval()

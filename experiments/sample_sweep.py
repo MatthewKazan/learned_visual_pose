@@ -16,9 +16,9 @@ import numpy as np
 
 from experiments.cpp_testing import GAP, edge, plot
 from visual_pose import _geometry as cpp
-from visual_pose.checkpoints import load_cnn_model
-from visual_pose.config import Config
-from visual_pose.data_utils.constants import REPO_DIR
+from visual_pose.training.checkpoints import load_cnn_model
+from visual_pose.config.config import Config
+from visual_pose.config.constants import REPO_DIR
 from visual_pose.data_utils.dataset import TartanAirSequence
 from visual_pose.evaluation.metrics import pose_error
 from visual_pose.evaluation.tables import report, worst_edges
