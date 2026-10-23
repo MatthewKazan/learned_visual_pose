@@ -50,7 +50,7 @@ HM3D_SPLITS = {
 # prefix)}. The one thing to edit. Renderer, sample building, split_trajectories and
 # the GUI all read it through hm3d_sequence.scene_dirs(role).
 HM3D_SCENES = {
-    "training": {"val": range(800, 900), "train": [*range(0, 100), *range(200, 288)]},
+    "training": {"val": range(800, 900), "train": [*range(0, 100), *range(200, 331)]},
     "validation": {"train": range(100, 200)},
 }
 # Rendered per scene. 215 MB a trajectory on disk. Validation wants many scenes, not many

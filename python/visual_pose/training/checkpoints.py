@@ -67,8 +67,8 @@ def load_transformer(run_name: str, checkpoint: str = "best.pt"):
         cfg = dataclasses.replace(cfg, zero_pose_features=False)
     if "odometry_residual" not in saved:
         cfg = dataclasses.replace(cfg, odometry_residual=state["tokenizer.embed_odometry.weight"].shape[1] == 39)
-    if "edge_to_vertex" not in saved:
-        cfg = dataclasses.replace(cfg, edge_to_vertex="tokenizer.vertex_msg_mlp.0.weight" in state)
+    if "edge_to_vertex" not in saved:   # edge -> vertex messages
+        cfg = dataclasses.replace(cfg, edge_to_vertex=False)
     if "residual_scale_rho" not in saved:   # unscaled before 2026-10-19 (not a weight: cannot be inferred)
         cfg = dataclasses.replace(cfg, residual_scale_rho=1.0, residual_scale_phi=1.0)
     if "descriptor_scale" not in saved:
@@ -77,6 +77,8 @@ def load_transformer(run_name: str, checkpoint: str = "best.pt"):
         cfg = dataclasses.replace(cfg, pose_noise_deg=0.0, pose_noise_m=0.0)
     if "feature_stats" not in saved:   # predates 2026-10-20: standardized runs carry the stats as buffers
         cfg = dataclasses.replace(cfg, feature_stats="out/feature_stats.json" if "tokenizer.pose_mean" in state else None)
+    if "whitened_residual" not in saved:   # predates 2026-10-22
+        cfg = dataclasses.replace(cfg, whitened_residual="tokenizer.embed_whitened_residual.weight" in state)
     model = TransformerSolver.from_config(cfg).to(DEVICE)
     model.load_state_dict(state)
     return model.eval(), cfg

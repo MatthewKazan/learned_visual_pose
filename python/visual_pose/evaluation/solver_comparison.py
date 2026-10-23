@@ -88,7 +88,12 @@ def transformer_ate(model: nn.Module, trajectories: list[Path], cfg: Transformer
     """
     Per trajectory, refine()'s poses scored against gt. T_in and gt come from sample.npz in
     float64, not the dataset's float32 features, so delta = 0 reproduces the odometry ATE exactly.
+    Also scored after each of max(cfg.ate_eval_iterations, cfg.refinement_iterations) single passes
+    ("iterations"); the top-level ate / ate_aligned stay at cfg.refinement_iterations, as trained.
     """
+    import dataclasses
+    one_pass = dataclasses.replace(cfg, refinement_iterations=1)
+    n_iter = max(cfg.ate_eval_iterations, cfg.refinement_iterations)
     # closures as build_transformer_loaders' val set: none for a closure_dropout = 1.0 model,
     # which never trained its closure embedding, all of them otherwise
     ds = PoseGraphDataset(trajectories, pass_descriptor=cfg.use_descriptor,
@@ -97,17 +102,24 @@ def transformer_ate(model: nn.Module, trajectories: list[Path], cfg: Transformer
     was_training = model.training
     model.eval()
     per = {}
+    per_iter = [{} for _ in range(n_iter)]
     try:
         for i, traj in enumerate(trajectories):
             batch = collate_pose_graph_ds([ds[i]])
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             with np.load(traj / SAMPLE_FILE) as data:
                 T_in, T_gt = data["poses"], data["gt_poses"]
-            T, delta_max = refine(model, batch, T_in, cfg)
-            per[trajectory_key(traj)] = {"V": len(T_in), **ates(T, T_gt), "delta_max": delta_max}
+            T, delta_max = T_in, 0.0
+            for it in range(n_iter):   # refine() one pass at a time: same result, scored after each
+                T, d = refine(model, batch, T, one_pass)
+                delta_max = max(delta_max, d)
+                per_iter[it][trajectory_key(traj)] = {**ates(T, T_gt), "delta_max": d}
+                if it + 1 == cfg.refinement_iterations:
+                    per[trajectory_key(traj)] = {"V": len(T_in), **ates(T, T_gt), "delta_max": delta_max}
     finally:
         model.train(was_training)
-    return {"per_trajectory": per, **summarise(per, ["ate", "ate_aligned"])}
+    return {"per_trajectory": per, **summarise(per, ["ate", "ate_aligned"]),
+            "iterations": [summarise(p, ["ate", "ate_aligned"]) for p in per_iter]}
 
 
 def compare_line(result: dict, baseline: dict | None) -> str:
@@ -142,4 +154,7 @@ def ate_epoch_hook(model: nn.Module, cfg: TransformerSolverConfig):
         device = next(model.parameters()).device
         result = transformer_ate(model, trajectories, cfg, device)
         print(f"[ate] epoch {epoch + 1}, {len(trajectories)} val graphs: {compare_line(result, baseline)}")
+        print(f"[ate] epoch {epoch + 1} by pass, median anchored / aligned: " + ", ".join(
+            f"{k + 1}: {r['ate']['median']:.3f} / {r['ate_aligned']['median']:.3f}"
+            for k, r in enumerate(result["iterations"])))
     return hook

@@ -1,45 +1,23 @@
-from pathlib import Path
 from typing import Optional
 
 import torch
 from torch import nn, Tensor
 
 from visual_pose.config.config import TransformerSolverConfig
-from visual_pose.config.constants import DEVICE, REPO_DIR
+from visual_pose.config.constants import DEVICE
 from visual_pose.models.transformer_solver.tokenizer import Tokenizer
 from visual_pose.models.transformer_solver.encoder import Encoder
 
 
 class TransformerSolver(nn.Module):
-    def __init__(
-            self,
-            descriptor_dim: int,
-            num_heads: int,
-            embed_dim: int,
-            ff_dim: int,
-            dropout: float,
-            num_layers: int,
-            use_descriptor: bool,
-            pe_in_geometry: bool = False,
-            closure_residual: bool = True,
-            closure_edge_mlp: bool = True,
-            zero_pose_features: bool = False,
-            odometry_residual: bool = False,
-            edge_to_vertex: bool = False,
-            residual_scale: tuple[float, float] = (1.0, 1.0),
-            descriptor_scale: float = 1.0,
-            feature_stats: Optional[Path] = None,
-    ):
+    def __init__(self, cfg: TransformerSolverConfig):
         super(TransformerSolver, self).__init__()
-        self.tokenizer = Tokenizer(embed_dim=embed_dim, descriptor_dim=descriptor_dim, use_descriptor=use_descriptor,
-                                   pe_in_geometry=pe_in_geometry, closure_residual=closure_residual,
-                                   closure_edge_mlp=closure_edge_mlp, zero_pose_features=zero_pose_features,
-                                   odometry_residual=odometry_residual, edge_to_vertex=edge_to_vertex,
-                                   residual_scale=residual_scale, descriptor_scale=descriptor_scale,
-                                   feature_stats=feature_stats)
-        self.encoder = Encoder(num_layers=num_layers, embed_dim=embed_dim, ff_dim=ff_dim, dropout=dropout, num_heads=num_heads)
+        self.cfg = cfg   # plain attribute, not in the state_dict
+        self.tokenizer = Tokenizer(cfg)
+        self.encoder = Encoder(num_layers=cfg.num_layers, embed_dim=cfg.embed_dim, ff_dim=cfg.ff_dim,
+                               dropout=cfg.dropout, num_heads=cfg.num_heads)
 
-        self.output = nn.Linear(embed_dim, 6) # Output corrective vector in tangent space of SE3 TODO: CONSIDER CLOSELY
+        self.output = nn.Linear(cfg.embed_dim, 6) # Output corrective vector in tangent space of SE3 TODO: CONSIDER CLOSELY
 
         with torch.no_grad():
             self.output.weight.zero_()
@@ -69,34 +47,28 @@ class TransformerSolver(nn.Module):
 
         x = self.encoder(embeddings, mask)# (B, V+E+1, embed_dim)
         pose_output = x[:, :poses.shape[1], :] # (B, V, embed_dim)
-        return self.output(pose_output) # (B, V, 6)
+        delta = self.output(pose_output) # (B, V, 6)
+        delta = torch.cat(
+            [torch.zeros_like(delta[:, :1]), delta[:, 1:]], # Fix vertex 0
+            dim=1
+        )
+        return delta
 
     @classmethod
     def from_config(cls, cfg: TransformerSolverConfig):
-        model = cls(
-            descriptor_dim=cfg.descriptor_dim,
-            embed_dim=cfg.embed_dim,
-            num_heads=cfg.num_heads,
-            ff_dim=cfg.ff_dim,
-            dropout=cfg.dropout,
-            num_layers=cfg.num_layers,
-            use_descriptor=cfg.use_descriptor,
-            pe_in_geometry=cfg.pe_in_geometry,
-            closure_residual=cfg.closure_residual,
-            closure_edge_mlp=cfg.closure_edge_mlp,
-            zero_pose_features=cfg.zero_pose_features,
-            odometry_residual=cfg.odometry_residual,
-            edge_to_vertex=cfg.edge_to_vertex,
-            residual_scale=(cfg.residual_scale_rho, cfg.residual_scale_phi),
-            descriptor_scale=cfg.descriptor_scale,
-            feature_stats=REPO_DIR / cfg.feature_stats if cfg.feature_stats else None,
-        )
+        model = cls(cfg)
         path = cfg.starting_checkpoint_path
         if path is not None:
             if not path.exists():
                 raise FileNotFoundError(f"starting_checkpoint {cfg.starting_checkpoint!r} -> {path} does not exist")
             state = torch.load(path, map_location=DEVICE, weights_only=False)
-            model.load_state_dict(state["model"])
+            # a starting checkpoint may predate whitened_residual: its layer starts from __init__ (zero-init),
+            # nothing else may be missing or extra
+            missing, unexpected = model.load_state_dict(state["model"], strict=False)
+            if unexpected:
+                raise RuntimeError(f"{path} does not match the model:  unexpected {unexpected}")
+            if missing:
+                print(f"WARNING: missing {missing}")
             print(f"initialised from {path} (epoch {state.get('epoch', -1) + 1}, "
                   f"{state.get('metric_name', 'metric')} {state.get('val_metric', float('nan')):.4f})")
         return model

@@ -309,6 +309,8 @@ class TransformerSolverConfig:
     embed_dim: int = 256
     ff_dim: int = 1024
     dropout: float = 0.1
+    # 2026-10-21, 3 backprop passes, largest graph (1450 tokens): peak MPS 7.4 GB at 6 layers, 12.5 at 12,
+    # 16.5 at 16, 19.6 at 20; 24 layers 23.6 GB and 4x slower per step (swapping on the 32 GB machine).
     num_layers: int = 6
     # Sweep 2026-10-13 (out/sweep/summary.json, 8 epochs, 20-graph ATE median): batch 1 0.145
     # vs batch 2 0.154 at lr 1e-4 -- twice the optimizer steps per epoch.
@@ -320,19 +322,21 @@ class TransformerSolverConfig:
     # AdamW, not the CNN's SGD 0.01: the usual transformer choice.
     optimizer: str = "adamw"
     # Sweep: 1e-4 median 0.154, 3e-4 0.163, 5e-5 0.159, 5e-4 stuck at odometry (0.246).
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-5   # fine-tune of ft_noe2v_b1_it3_bp, as that run was itself trained
     weight_decay: float = 1e-2
     # 16-epoch cosine: median 0.140 / aligned 0.093, vs 0.145 / 0.093 at 8; the old 50-epoch
     # runs plateaued by epoch ~14 at 0.165 / 0.103.
-    num_epochs: int = 16
+    num_epochs: int = 8
     print_freq: int = 20
     # ATE against cached GN (experiments/gn_baseline.py) on the first N val trajectories
     ate_eval_every: int = 2
     ate_eval_trajectories: int = 20
+    # also scored after each of this many passes, the model re-run on its own corrected poses
+    ate_eval_iterations: int = 10
 
-    run_name: str = "full_G1_std"   # where THIS run saves: checkpoints/<run_name>/
+    run_name: str = "ft6_bp3_whiten"   # where THIS run saves: checkpoints/<run_name>/
     # best so far: checkpoints/sweep_final_lr1e4_b1_p64_e16/best.pt (this config, 16 epochs)
-    starting_checkpoint: Optional[str] = None
+    starting_checkpoint: Optional[str] = "ft_noe2v_b1_it3_bp/best.pt"   # best model so far (0.087 / 0.057 at pass 2)
     loss_trans_weight: float = 0.36
     loss_huber_threhold: float = 1.0
     loss_fn: str = "chordial_relative"   # l2 | chordial (vertex only) | chordial_relative (pose_loss)
@@ -344,10 +348,10 @@ class TransformerSolverConfig:
     # 1 = single pass. Iteration lost in every form tried: 3 random-depth passes from scratch
     # median 0.169 / aligned 0.107 vs 0.163 / 0.098; 3 passes with gradients throughout
     # 0.152 / 0.102 vs 0.145 / 0.093 at batch 1, 64 points (and 2x slower).
-    refinement_iterations: int = 1
+    refinement_iterations: int = 3
     # False: random-depth no-grad passes + one trained pass (memory 1 pass). True: all passes
     # in the loss with gradients through them (memory ~refinement_iterations passes).
-    refinement_backprop: bool = False
+    refinement_backprop: bool = True
     closure_dropout: float = 0.0
     # Old tokenizer, for comparison and for loading checkpoints from before 2026-10-16: the
     # positional encoding added to every point before pooling, scaled by a learned pe_scalar
@@ -368,13 +372,6 @@ class TransformerSolverConfig:
     # Odometry tokens also get their residual (as closure_residual). On chained odometry it is exactly 0;
     # it carries information once the input poses are perturbed (pose_noise_*) or refined.
     odometry_residual: bool = True
-    # TRAINING graphs only: each vertex's input pose (not vertex 0, the gauge anchor) right-perturbed by
-    # Exp of N(0, deg) rotation and N(0, m) translation, independently per vertex. The odometry edges are
-    # then the only way to undo it: a model that improves on noisy input must be using them.
-    # Edge -> vertex messages (graph-network node update): each vertex adds the mean of messages from
-    # its incident odometry edges and closures. E2 (2026-10-19): with only attention to route an
-    # edge's residual to its vertices, masking the edges changed nothing, even on noisy input.
-    edge_to_vertex: bool = True
     # Multipliers on the residual's rho (translation, TRANSLATION_NORM units) and phi (rad) before
     # the embedding. Measured on noisy (2 deg, 5 cm) eval graphs: std 0.0072 and 0.049, against the
     # information log-diagonal at ~13 -- at 1.0 the residual is ~1/1000 of the token. 100 / 20 -> std ~1.
@@ -384,6 +381,9 @@ class TransformerSolverConfig:
     # a component) against points in metres (std ~1): after embedding the descriptor term was 0.10-0.16
     # of the point term, then LayerNorm-ed together. 25 -> std ~1 a component.
     descriptor_scale: float = 25.0
+    # TRAINING graphs only: each vertex's input pose (not vertex 0, the gauge anchor) right-perturbed by
+    # Exp of N(0, deg) rotation and N(0, m) translation, independently per vertex. The odometry edges are
+    # then the only way to undo it: a model that improves on noisy input must be using them.
     pose_noise_deg: float = 2.0
     pose_noise_m: float = 0.05
     chordial_cap: float = 0.1
@@ -391,6 +391,11 @@ class TransformerSolverConfig:
     # measured by /tmp/featstats/measure.py on 300 training graphs). Overrides residual_scale_* and
     # descriptor_scale (both treated as 1). None = off, as every run before 2026-10-20.
     feature_stats: Optional[str] = "out/feature_stats.json"
+    # Each edge token += Linear(L^T r), Omega = L L^T: the residual in units of its own information, whose
+    # squared length is GN's per-edge cost r^T Omega r. The model ignored Omega given separately
+    # (information -> mean changed nothing, 2026-10-20) although it ranks true closure error (Spearman 0.74).
+    whitened_residual: bool = True
+    edge_to_vertex: bool = True # every edge sends a message to each endpoint, each vertex adds the mean of what it receives
 
     @property
     def checkpoint_dir(self) -> Path:
