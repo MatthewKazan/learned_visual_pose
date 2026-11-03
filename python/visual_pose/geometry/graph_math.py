@@ -62,13 +62,13 @@ def update_ground_truth_residual(updated_poses: Tensor, gt_poses: Tensor) -> tup
 
 
 
-def rotate_points_to_world(points: Tensor, poses: Tensor):
+def rotate_points_to_world(points: Tensor, poses: Tensor, add_translation=False):
 
     # (B, V, 3, 3) @ (B, V, P, 3)
     pose_mat = poses.unflatten(-1, (3, 4))
     R_in, t_in = pose_mat[..., :3, :3], pose_mat[..., :3, 3]
     # pose->world(B, V, 3, 3) @ point in pose frame(B, V, 3, P) = point in world frame(B, V, 3, P)
     points = (R_in @ points.transpose(-1, -2)).transpose(-1, -2)
-    # if add_translation:
-    #     points = points + t_in.unsqueeze(-2)
+    if add_translation:
+        points = points + t_in.unsqueeze(-2)
     return points

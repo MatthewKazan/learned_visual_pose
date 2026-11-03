@@ -215,7 +215,8 @@ def build_transformer_loaders(cfg: TransformerSolverConfig) -> tuple[DataLoader,
     ds_val = dict(pass_descriptor=cfg.use_descriptor, num_points=cfg.points_per_keyframe, closure_dropout=0.0 if cfg.closure_dropout != 1.0 else 1.0)
     ds_train = ds_val.copy()
     ds_train['closure_dropout'] = cfg.closure_dropout
-    ds_train.update(pose_noise_deg=cfg.pose_noise_deg, pose_noise_m=cfg.pose_noise_m)   # training only: val stays comparable
+    # training only: val stays comparable
+    ds_train.update(pose_noise_deg=cfg.pose_noise_deg, pose_noise_m=cfg.pose_noise_m, augment=cfg)
     return (DataLoader(PoseGraphDataset(train, **ds_train), shuffle=True, **loader),
             DataLoader(PoseGraphDataset(val, random_points=False, **ds_val), shuffle=False, **loader))
 

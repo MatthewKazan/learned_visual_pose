@@ -77,6 +77,7 @@ class WorldModel:
         self.cfg = cfg
         self.get_relative_pose = get_relative_pose
         self.loop_closure_clusters = []
+        self.rejected_loop_closures = []
 
     # -- keyframes ----------------------------------------------------------
 
@@ -281,11 +282,20 @@ class WorldModel:
         measurement = self.measurement(fit)
 
         if is_closure:
+            # REFUSED CLOSURES: every candidate with a fit and an information matrix is recorded with the
+            # gate statistics as they were at this moment (the gates are sequential: d^2 depends on which
+            # earlier closures were admitted, so they cannot be replayed later). GN still sees only the
+            # admitted ones; the transformer can be given the refused ones too (pose_graph_samples).
+            agreement = self.depth_agreement(seq_idx_i, seq_idx_j, measurement)
+            reason, stats = self.closure_gate(seq_idx_i, seq_idx_j, measurement, information)
             if len(fit.inliers) < self.cfg.loop_min_inliers:
-                return False
-            if self.depth_agreement(seq_idx_i, seq_idx_j, measurement) < self.cfg.closure_min_agreement:
-                return False
-            if not self.chain_consistent_gate(seq_idx_i, seq_idx_j, measurement, information):
+                reason = "loop_min_inliers"
+            elif agreement < self.cfg.closure_min_agreement:
+                reason = "depth_agreement"
+            if reason is not None:
+                self.rejected_loop_closures.append(dict(
+                    i=seq_idx_i, j=seq_idx_j, Z=measurement, information=information, inliers=len(fit.inliers),
+                    agreement=agreement, reason=reason, **stats))
                 return False
 
         if seq_idx_i not in self.vertex_index and seq_idx_j not in self.vertex_index:
@@ -417,25 +427,40 @@ class WorldModel:
         Config.odometry_min_inliers), so the closures crossing it are exactly
         the ones this test lets through.
         """
+        return self.closure_gate(i, j, Z_ij, information)[0] is None
+
+    def closure_gate(self, i: int, j: int, Z_ij: np.ndarray, information: np.ndarray) -> tuple[str | None, dict]:
+        """
+        chain_consistent_gate's checks in order, returning (the first failing check's name or None,
+        statistics): rot_residual (rad), t_chain and t_meas (m), d2. REFUSED CLOSURES: the statistics
+        are what add_edge records for a refused candidate. Every check runs so the stats are complete.
+        """
+        stats = dict(rot_residual=np.nan, t_chain=np.nan, t_meas=np.nan, d2=np.nan)
         if i not in self.chain_pos or j not in self.chain_pos:
-            return True     # off-chain endpoint: nothing to test against
+            return None, stats     # off-chain endpoint: nothing to test against
         vertices = self.factor_graph.vertices
         T_Wi, T_Wj = vertices[self.vertex_index[i]].pose, vertices[self.vertex_index[j]].pose
         r = np.asarray((T_Wi * cpp.PoseSE3(Z_ij) * T_Wj.inverse()).log()).ravel()
-        if np.linalg.norm(r[3:]) > self.cfg.max_residual_threshold:
-            return False
+        stats["rot_residual"] = float(np.linalg.norm(r[3:]))
         # A fit that collapses the baseline: measured translation a small
         # fraction of what the chain says, over a chain span long enough that
         # drift cannot explain it. See Config.closure_collapse_ratio.
-        t_chain = np.linalg.norm(np.asarray((T_Wi.inverse() * T_Wj).translation()))
-        t_meas = np.linalg.norm(np.asarray(Z_ij)[:3, 3])
-        if t_chain > self.cfg.closure_collapse_min_m and t_meas < self.cfg.closure_collapse_ratio * t_chain:
-            return False
+        stats["t_chain"] = t_chain = float(np.linalg.norm(np.asarray((T_Wi.inverse() * T_Wj).translation())))
+        stats["t_meas"] = t_meas = float(np.linalg.norm(np.asarray(Z_ij)[:3, 3]))
         lo, hi = sorted((self.chain_pos[i], self.chain_pos[j]))
         covariance = (self.chain_prefix[hi] - self.chain_prefix[lo]
                       + self._to_world(j, np.linalg.inv(information)))
-        d_squared = float(r @ np.linalg.solve(covariance, r))
-        return d_squared <= self.cfg.closure_gate_threshold
+        try:
+            stats["d2"] = d_squared = float(r @ np.linalg.solve(covariance, r))
+        except np.linalg.LinAlgError:   # before this refactor d2 was never evaluated after a rotation refusal
+            d_squared = np.inf
+        if stats["rot_residual"] > self.cfg.max_residual_threshold:
+            return "rotation", stats
+        if t_chain > self.cfg.closure_collapse_min_m and t_meas < self.cfg.closure_collapse_ratio * t_chain:
+            return "collapse", stats
+        if d_squared > self.cfg.closure_gate_threshold:
+            return "d2", stats
+        return None, stats
 
     def optimize(self, solve: SolveFn, calibrate: bool = True) -> np.ndarray | None:
         """

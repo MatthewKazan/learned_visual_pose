@@ -36,14 +36,21 @@ class TransformerSolver(nn.Module):
                 closure_mask: Tensor,  # (B, L) bool, True = padding
                 odom_mask: Tensor,  # (B, O) bool, True = padding
 
-    ) -> Tensor:  # (B, V, 6) correction vector in tangent space of SE(3), apply as right perturb to current best guess
+    ) -> tuple[Tensor, dict[str, Optional[Tensor]]]:
+        """
+        -> delta (B, V, 6) correction vector in tangent space of SE(3), apply as right perturb to current best guess;
+           extras for auxiliary losses: slot_attn (B, K, V*P) softmax over slots, None without slot_attention.
+        """
         if descriptors is not None:
             descriptors = descriptors.float()
-        embeddings = self.tokenizer(poses, points, closures, closures_ij, odometry, odometry_ij, descriptors,
-                                    odom_mask=odom_mask, closure_mask=closure_mask) # (B, V+E+1, embed_dim)
+        embeddings, slot_attn = self.tokenizer(poses, points, closures, closures_ij, odometry, odometry_ij, descriptors,
+                                    odom_mask=odom_mask, closure_mask=closure_mask, vertex_mask=vertex_mask) # (B, V[+K]+E+1, embed_dim)
         scene_mask = torch.zeros(embeddings.shape[0], 1, dtype=torch.bool, device=embeddings.device)  # never padding
+        # slots are never padding: a short trajectory's extra slots win nothing and average its real points
+        num_slots = embeddings.shape[1] - vertex_mask.shape[1] - odom_mask.shape[1] - closure_mask.shape[1] - 1
+        slot_mask = torch.zeros(embeddings.shape[0], num_slots, dtype=torch.bool, device=embeddings.device)
 
-        mask = torch.cat([vertex_mask, odom_mask, closure_mask, scene_mask], dim=1)
+        mask = torch.cat([vertex_mask, slot_mask, odom_mask, closure_mask, scene_mask], dim=1)
 
         x = self.encoder(embeddings, mask)# (B, V+E+1, embed_dim)
         pose_output = x[:, :poses.shape[1], :] # (B, V, embed_dim)
@@ -52,7 +59,7 @@ class TransformerSolver(nn.Module):
             [torch.zeros_like(delta[:, :1]), delta[:, 1:]], # Fix vertex 0
             dim=1
         )
-        return delta
+        return delta, {"slot_attn": slot_attn}
 
     @classmethod
     def from_config(cls, cfg: TransformerSolverConfig):

@@ -9,7 +9,7 @@ from typing import List, Any, Optional
 
 from visual_pose.config.config import TransformerSolverConfig
 from visual_pose.config.constants import REPO_DIR
-from visual_pose.geometry.graph_math import relative, update_ground_truth_residual
+from visual_pose.geometry.graph_math import relative, update_ground_truth_residual, rotate_points_to_world
 from visual_pose.models.positional_encoding import positional_encoding_1d
 
 
@@ -106,7 +106,10 @@ class Tokenizer(nn.Module):
             self.register_buffer("residual_scale", torch.tensor([cfg.residual_scale_rho] * 3 + [cfg.residual_scale_phi] * 3),
                                  persistent=False)
 
-        self.geometry_tokenizer = GeometryTokenizer(self.cfg)
+        if self.cfg.slot_attention:
+            self.geometry_tokenizer = SlotAttnTokenizer(self.cfg)
+        else:
+            self.geometry_tokenizer = GeometryTokenizer(self.cfg)
 
 
 
@@ -187,6 +190,7 @@ class Tokenizer(nn.Module):
             descriptor: Tensor, # (B, V, P, desc_dim)
             odom_mask: Optional[Tensor] = None,  # (B, O) bool, True = padding; needed by edge_to_vertex
             closure_mask: Optional[Tensor] = None,  # (B, L)
+            vertex_mask: Optional[Tensor] = None,  # (B, V) bool, True = padding; needed by slot_attention
     ) -> Tensor:
         info_closure = information_matrix(closures)
         info_odom = information_matrix(odometry)
@@ -194,6 +198,7 @@ class Tokenizer(nn.Module):
         closures = normalize_edges(closures)
         odometry = normalize_edges(odometry)
         poses = poses.clone()
+        raw_poses = poses.clone()
         poses[..., 3:12:4] /= TRANSLATION_NORM
 
         log_res_closure, log_res_odom = None, None
@@ -221,7 +226,11 @@ class Tokenizer(nn.Module):
 
         # (V, embed_dim)
         pe = positional_encoding_1d(seq_len=pose_embedding.shape[1], input_dim=pose_embedding.shape[2], device=pose_embedding.device)
-        geo_embedding = self.geometry_tokenizer(points, descriptor, pe if self.cfg.pe_in_geometry else None)
+        if self.cfg.slot_attention:
+            # geo_embedding (B, V, F) the readback; slot_tokens (B, K, F) join the sequence below
+            geo_embedding, slot_tokens, attn = self.geometry_tokenizer(points, descriptor, raw_poses, vertex_mask=vertex_mask)
+        else:
+            geo_embedding = self.geometry_tokenizer(points, descriptor, pe if self.cfg.pe_in_geometry else None)
 
         #          (B, V, embed_dim) + (B, V, embed_dim) + (1, V, embed_dim)
         sequence_tokens = pose_embedding + geo_embedding
@@ -269,7 +278,9 @@ class Tokenizer(nn.Module):
 
         scene_token = self.scene_embedding_token_init.expand(pose_embedding.shape[0], -1, -1) # (B, 1, embed_dim)
 
-        return torch.concat([sequence_tokens, edge_token, scene_token], dim=1) # (B, V+E+1, embed_dim)
+        if self.cfg.slot_attention:   # vertices first: the transformer reads the poses from x[:, :V]
+            return torch.concat([sequence_tokens, slot_tokens, edge_token, scene_token], dim=1), attn # (B, V+K+E+1, embed_dim)
+        return torch.concat([sequence_tokens, edge_token, scene_token], dim=1), None # (B, V+E+1, embed_dim)
 
 
 class GeometryTokenizer(nn.Module):
@@ -357,6 +368,152 @@ class GeometryTokenizer(nn.Module):
         return self.output_layer(pooled) # return (B, V, F)
 
 
+class SlotAttnTokenizer(nn.Module):
+    def __init__(
+            self,
+            cfg: TransformerSolverConfig
+    ):
+        super(SlotAttnTokenizer, self).__init__()
+        self.cfg = cfg
+        self.embed_dim = cfg.embed_dim
+        self.mu =  nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.log_sigma = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+
+        self.embed_points = nn.Sequential(
+            nn.Linear(3, self.embed_dim),
+            nn.GELU(),
+            nn.Linear(self.embed_dim, self.embed_dim),
+        )
+        self.embed_descriptor = nn.Linear(self.cfg.descriptor_dim, self.embed_dim, bias=True)
+
+        self.w_k = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        self.w_v = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+        self.w_q = nn.Linear(self.embed_dim, self.embed_dim, bias=False)
+
+        self.norm_inputs = nn.LayerNorm(self.embed_dim)
+        self.norm_slots = nn.LayerNorm(self.embed_dim)
+        self.gru = nn.GRUCell(self.embed_dim, self.embed_dim)
+        if self.cfg.use_residual_mlp_for_slots:
+            self.layer_norm = nn.LayerNorm(self.embed_dim)
+            self.residual_mlp = nn.Sequential(
+                nn.Linear(self.embed_dim, self.embed_dim),
+                nn.GELU(),
+                nn.Linear(self.embed_dim, self.embed_dim),
+            )
+        self.readback_mlp = nn.Sequential(   # [e (3), c (3), log1p other mass (1), slot (F)], metres
+            nn.Linear(7 + self.embed_dim, self.embed_dim),
+            nn.GELU(),
+            nn.Linear(self.embed_dim, self.embed_dim),
+        )
+
+    def forward(self,
+                points: Tensor,
+                descriptor: Tensor,
+                raw_poses: Tensor,
+                vertex_mask: Optional[Tensor] = None,  # (B, V) bool, True = padding
+                num_iter: int = 3
+    ):
+        """
+
+        :param raw_poses: (B, V, 12) metric, not divided by TRANSLATION_NORM
+        :param points:
+        :param descriptor:
+        :return: g (B, V, F) per-keyframe readback, slots (B, K, F), attn (B, K, V*P) the last iteration's
+                 weights, softmax over slots
+        """
+        num_slots = int(points.shape[1] * self.cfg.slot_num_multiplier) # K
+        slots = torch.randn(points.shape[0], num_slots, self.embed_dim, device=points.device, dtype=points.dtype)
+        slots = self.mu + self.log_sigma.exp() * slots
+
+
+        # Same as one Linear on the per-point token [x, y, z, d], split by columns:
+        #   W [x; d] + b = [W_xyz  W_d] [x; d] + b = W_xyz x + W_d d + b
+        # Split so each input gets its own init/normalisation, the descriptor
+        # term can be skipped (geometry-only) or zero-initialised when added later.
+        points_world_m = rotate_points_to_world(points, raw_poses, add_translation=True)   # metres, for readback
+        points_token = self.embed_points(points_world_m / self.cfg.point_scale)  # (B, V, P, 3) -> (B, V, P, F)
+
+        if descriptor is not None:
+            descriptor_token = self.embed_descriptor(
+                descriptor * self.cfg.descriptor_scale)  # (B, V, P, desc_dim) -> (B, V, P, F)
+            geo_token = points_token + descriptor_token  # (B, V, P, F) + (B, V, P, F) = (B, V, P, F)
+        else:   # use_descriptor=False, the geometry-only control: same as zero descriptors (the bias is a constant)
+            geo_token = points_token
+        geo_token = self.norm_inputs(geo_token.flatten(1,2)) # (B, V, P, F) -> (B, V*P, F)
+
+        key = self.w_k(geo_token)     # (B, V*P, F) -> (B, V*P, F)
+        value = self.w_v(geo_token)   # (B, V*P, F) -> (B, V*P, F)
+        if vertex_mask is not None:
+            point_mask = vertex_mask.unsqueeze(-1).expand(-1, -1, points.shape[2]).reshape(points.shape[0], 1, -1)  # (B, 1, V*P)
+
+        B, K, D = slots.shape   # not F: that name is torch.nn.functional in this module
+        for _ in range(num_iter):
+            query = self.w_q(self.norm_slots(slots))       # (B, K, F)   -> (B, K, F)
+
+            sim = torch.matmul(query, key.transpose(-2, -1)) / self.embed_dim**0.5 # (B, K, F) @ (B, F, V*P) -> (B, K, V*P)
+            # + eps before the mask: a slot that wins nothing averages all real points instead of 0/0 = NaN
+            attn = torch.softmax(sim, dim=1) + 1e-8 # (B, K, V*P)
+            if vertex_mask is not None:
+                # zeroed after the softmax, not -inf before it: the softmax runs over slots, so a padded point's
+                # column would be all -inf -> NaN. Each column is independent, so zeroing it changes no real point.
+                attn = attn.masked_fill(point_mask, 0.0)
+
+            # slot attn normalizes across slots, so sum of attn weights for input feature j is 1
+            features = attn @ value / attn.sum(dim=-1, keepdim=True)
+            # GRUCell, not GRU: each slot updated on its own; GRU would run along the K slots as a sequence
+            slots = self.gru(features.reshape(B * K, D), slots.reshape(B * K, D)).reshape(B, K, D)
+            if self.cfg.use_residual_mlp_for_slots:
+                slots = slots + self.residual_mlp(self.layer_norm(slots))   # not +=: layer_norm saved slots for backward
+
+        return self.readback(points, points_world_m, slots, attn), slots, attn
+
+
+    def readback(self, points_cam: Tensor, points_world: Tensor, slots: Tensor, attn: Tensor) -> Tensor:
+        """
+        Per keyframe i and slot k, with a_kip the weight slot k took from point p of keyframe i:
+            w_ik = sum_p a_kip                                   how much of slot k keyframe i sees
+            c_ik = sum_p a_kip x_cam / w_ik                      where i sees it (camera frame, lever arm)
+            L_k^(-i) = sum_{j!=i,p} a_kjp x_world / sum_{j!=i,p} a_kjp   consensus of the OTHER keyframes
+            e_ik = R_i c_ik + t_i - L_k^(-i)                     i's disagreement with them
+        Leave-one-out: with L_k from all views, i's own view pulls e toward 0 (by half with two views).
+        g_i = sum_k w_ik MLP([e, c, log1p(other mass), s_k]) / sum_k w_ik over i's top-m slots by w.
+
+        :param points_cam: (B, V, P, 3) metres
+        :param points_world: (B, V, P, 3) metres, under the current poses
+        :param slots: (B, K, F)
+        :param attn: (B, K, V*P) softmax over slots, padded points 0
+        :return: g (B, V, F)
+        """
+        B, V, P, _ = points_cam.shape
+        K = slots.shape[1]
+        a = attn.reshape(B, K, V, P).transpose(1, 2)                      # (B, V, K, P)
+        w = a.sum(dim=-1)                                                  # (B, V, K)
+        cam_sum = a @ points_cam                                           # (B, V, K, P) @ (B, V, P, 3) -> (B, V, K, 3)
+        world_sum = a @ points_world                                       # (B, V, K, 3)
+
+        c = cam_sum / (w.unsqueeze(-1) + 1e-8)
+        # i's own placement of slot k, R_i c_ik + t_i, is world_sum / w: the weighted mean commutes with the rigid map
+        placed = world_sum / (w.unsqueeze(-1) + 1e-8)
+        other_mass = w.sum(dim=1, keepdim=True) - w                       # (B, V, K)
+        other_world = world_sum.sum(dim=1, keepdim=True) - world_sum      # (B, V, K, 3)
+        consensus = other_world / (other_mass.unsqueeze(-1) + 1e-8)
+        # a slot no other keyframe sees has no consensus: 0/eps is noise, so no disagreement either
+        e = (placed - consensus) * (other_mass > 1e-3).unsqueeze(-1)
+
+        # a keyframe sees few of the K slots: keep its top m by w (all K would be V*K MLP rows, ~590k at V=384)
+        m = min(self.cfg.readback_top_m, K)
+        w_top, idx = w.topk(m, dim=-1)                                     # (B, V, m)
+        idx3 = idx.unsqueeze(-1).expand(-1, -1, -1, 3)
+        batch = torch.arange(B, device=slots.device).view(B, 1, 1)
+        features = torch.cat((
+            e.gather(2, idx3),
+            c.gather(2, idx3),
+            torch.log1p(other_mass.gather(2, idx)).unsqueeze(-1),
+            slots[batch, idx],                                             # (B, V, m, F)
+        ), dim=-1)                                                         # (B, V, m, 7 + F)
+        msg = self.readback_mlp(features)                                  # (B, V, m, F)
+        # padded keyframes have w = 0 everywhere: 0 / eps = 0
+        return (w_top.unsqueeze(-1) * msg).sum(dim=2) / (w_top.sum(dim=-1, keepdim=True) + 1e-8)
 
 
 

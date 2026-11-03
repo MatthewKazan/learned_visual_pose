@@ -218,6 +218,24 @@ def save_graph(traj_dir: Path, front: Frontend, variant: Variant, split: str | N
     )
     if sequence.has_ground_truth:
         arrays["gt_poses"] = np.asarray([sequence.pose(f) for f in order], dtype=np.float64).reshape(-1, 4, 4)
+    # REFUSED CLOSURES (WorldModel.add_edge): candidates with a RANSAC fit and an information matrix that a
+    # gate refused, as frame pairs, with the gate statistics at the moment of refusal:
+    #   rejected_ij (R,2), rejected_Z (R,4,4) Z_ij, rejected_info (R,6,6),
+    #   rejected_stats (R,6) = [inliers, depth agreement, rotation residual rad, t_chain m, t_meas m, d2],
+    #   rejected_reason (R,) index into REJECT_REASONS
+    rej = front.world.rejected_loop_closures
+    arrays.update(
+        rejected_ij=np.asarray([(r["i"], r["j"]) for r in rej], dtype=np.int64).reshape(-1, 2),
+        rejected_Z=np.asarray([r["Z"] for r in rej], dtype=np.float64).reshape(-1, 4, 4),
+        rejected_info=np.asarray([r["information"] for r in rej], dtype=np.float64).reshape(-1, 6, 6),
+        rejected_stats=np.asarray([[r["inliers"], r["agreement"], r["rot_residual"], r["t_chain"], r["t_meas"], r["d2"]]
+                                   for r in rej], dtype=np.float64).reshape(-1, 6),
+        rejected_reason=np.asarray([REJECT_REASONS.index(r["reason"]) for r in rej], dtype=np.int64),
+    )
+    summary["rejected"] = len(rej)
     np.savez(traj_dir / GRAPH_SIDECAR, **arrays)
     return summary
+
+
+REJECT_REASONS = ("loop_min_inliers", "depth_agreement", "rotation", "collapse", "d2")   # REFUSED CLOSURES
 

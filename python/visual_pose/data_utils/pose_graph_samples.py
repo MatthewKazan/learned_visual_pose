@@ -108,13 +108,38 @@ def sample_arrays(graph: cpp.FactorGraph, edge_is_closure: np.ndarray, vertex_fr
     return data
 
 
+def refused_arrays(side: dict, vertex_frames: np.ndarray, gt: np.ndarray | None) -> dict[str, np.ndarray]:
+    """
+    REFUSED CLOSURES: the sidecar's rejected_* (frame pairs) as sample arrays in VERTEX indices, the
+    same layout as the closure arrays: refused_ij (R,2), refused_Z (R,4,4), refused_info (R,6,6),
+    refused_stats (R,6) [inliers, agreement, rot residual rad, t_chain, t_meas, d2], refused_reason (R,)
+    (frontend.REJECT_REASONS), and with gt: refused_rot_err_deg, refused_t_err_m. Empty arrays when the
+    sidecar predates the recording, so every sample has the keys.
+    """
+    ij = side.get("rejected_ij", np.zeros((0, 2), np.int64))
+    frame_to_vertex = {int(f): v for v, f in enumerate(vertex_frames)}
+    vij = np.array([(frame_to_vertex[int(i)], frame_to_vertex[int(j)]) for i, j in ij], dtype=np.int64).reshape(-1, 2)
+    out = dict(refused_ij=vij,
+               refused_Z=side.get("rejected_Z", np.zeros((0, 4, 4))).reshape(-1, 4, 4),
+               refused_info=side.get("rejected_info", np.zeros((0, 6, 6))).reshape(-1, 6, 6),
+               refused_stats=side.get("rejected_stats", np.zeros((0, 6))).reshape(-1, 6),
+               refused_reason=side.get("rejected_reason", np.zeros((0,), np.int64)))
+    if gt is not None:
+        out["refused_rot_err_deg"], out["refused_t_err_m"] = relative_errors(vij, out["refused_Z"], gt)
+    return out
+
+
 def build_sample(traj_dir: Path, points: int = CFG.num_point_samples) -> Path:
     with np.load(traj_dir / GRAPH_SIDECAR) as side:
         vertex_frames, n_odom = side["vertex_frames"], int(side["n_odometry"])
         gt, split = side["gt_poses"], side["split"] if "split" in side else np.array("None")
+        # REFUSED CLOSURES: sidecars written before the recording have none; those get empty arrays
+        refused = {k: side[k] for k in ("rejected_ij", "rejected_Z", "rejected_info", "rejected_stats", "rejected_reason")
+                   if k in side}
     graph = cpp.FactorGraph(str(traj_dir / GRAPH_FILE))
     data = sample_arrays(graph, np.arange(len(graph.edges)) >= n_odom, vertex_frames,
                          SavedHM3DFrames(traj_dir), points, gt)
+    data.update(refused_arrays(refused, vertex_frames, data["gt_poses"]))
     uvs = data["uvs"]
     out = traj_dir / SAMPLE_FILE
     # Descriptors are read at uvs in each keyframe's rgb, so they outlive a new graph unless the

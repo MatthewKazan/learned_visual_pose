@@ -390,12 +390,52 @@ class TransformerSolverConfig:
     # Per-column (x - mean) / std on every embedding input, stats from this file (relative to the repo,
     # measured by /tmp/featstats/measure.py on 300 training graphs). Overrides residual_scale_* and
     # descriptor_scale (both treated as 1). None = off, as every run before 2026-10-20.
-    feature_stats: Optional[str] = "out/feature_stats.json"
+    feature_stats: Optional[str] = None
     # Each edge token += Linear(L^T r), Omega = L L^T: the residual in units of its own information, whose
     # squared length is GN's per-edge cost r^T Omega r. The model ignored Omega given separately
     # (information -> mean changed nothing, 2026-10-20) although it ranks true closure error (Spearman 0.74).
     whitened_residual: bool = True
     edge_to_vertex: bool = True # every edge sends a message to each endpoint, each vertex adds the mean of what it receives
+
+    # Load-time augmentation, TRAINING graphs only (pose_graph_dataset.augment), in this order. All off here:
+    # every run before 2026-11-03 trained without them. Values in comments are the suggested strengths.
+    # Depth: z' = z + N(0, sigma), sigma = s0 + s1 z^2 metres, along the ray (suggest 0.005, 0.002: 1.3 cm
+    # at 2.5 m, 5.5 cm at 5 m).
+    depth_noise_s0: float = 0.0
+    depth_noise_s1: float = 0.0
+    depth_hole_fraction: float = 0.0     # replaced by copies of the keyframe's other points (suggest 0.05)
+    depth_flying_fraction: float = 0.0   # moved along the ray to U(0.2 m, keyframe max depth) (suggest 0.01)
+    # Every odometry Z right-perturbed, Z Exp(delta), delta ~ N(0, deg) / N(0, m) (suggest 0.3 deg, 0.005 m);
+    # with odom_outlier_prob (suggest 0.05) a larger one, angle U(deg range), translation U(m range).
+    odom_noise_deg: float = 0.0
+    odom_noise_m: float = 0.0
+    odom_outlier_prob: float = 0.0
+    odom_outlier_deg_min: float = 2.0
+    odom_outlier_deg_max: float = 5.0
+    odom_outlier_m_min: float = 0.05
+    odom_outlier_m_max: float = 0.10
+    # With this probability one odometry edge (never edge 0) Z <- Z D, D a U(deg range) rotation about a random
+    # axis and a U(0, m) translation, its information set to Config's unknown covariance. Item key odometry_aug = 1.
+    odom_break_prob: float = 0.0
+    odom_break_deg_min: float = 30.0
+    odom_break_deg_max: float = 150.0
+    odom_break_m: float = 2.0
+    # Each odometry edge (never edge 0) hidden with this probability: Z <- the previous edge's Z (constant
+    # velocity), unknown covariance. Item key odometry_aug = 2.
+    odom_dropout: float = 0.0
+    # Input and gt poses both left-multiplied by one G: "none" | "yaw" (about vertex 0's +Y, which HM3D keeps
+    # vertical: R_yy mean 0.976 in feature_stats) | "so3" (uniform). Translation U(-m, m) per axis.
+    # Loss, delta targets and edge residuals are invariant to G; the pose features and feature_stats are not.
+    world_rotation: str = "none"
+    world_translation_m: float = 0.0
+
+    # SlotAttnTokenizer: K = int(V * slot_num_multiplier) trajectory slots (V median 247, max 540 over train),
+    # appended to the encoder sequence after the vertex tokens; vertex tokens then carry no geometry of their own.
+    slot_attention: bool = False
+    slot_num_multiplier: float = 4.0
+    point_scale: float = 10.0   # world-frame points / this, same units as the poses (tokenizer.TRANSLATION_NORM)
+    use_residual_mlp_for_slots: bool = True
+    readback_top_m: int = 16   # slots per keyframe read back, by mass (a keyframe sees few of the K)
 
     @property
     def checkpoint_dir(self) -> Path:

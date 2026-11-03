@@ -8,10 +8,13 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 from visual_pose import _geometry as cpp
+from visual_pose.config.config import Config, TransformerSolverConfig
 from visual_pose.data_utils.pose_graph_samples import DESCRIPTOR_FILE, SAMPLE_FILE, is_current
 
 
 _UPPER = torch.triu_indices(6, 6)   # the 21 entries of a symmetric 6x6 that are not duplicates
+# WorldModel.unknown_information: what the frontend gives an edge it could not verify
+UNKNOWN_INFO = np.diag(1.0 / np.array([Config.unknown_edge_sigma_t] * 3 + [Config.unknown_edge_sigma_r] * 3) ** 2)
 
 
 def pose_features(T: np.ndarray) -> Tensor:
@@ -82,6 +85,7 @@ class PoseGraphDataset(Dataset):
             closure_dropout: float = 0.0,
             pose_noise_deg: float = 0.0,
             pose_noise_m: float = 0.0,
+            augment: Optional[TransformerSolverConfig] = None,
     ):
         # samples are built offline (python -m visual_pose.data_utils.pose_graph_samples), never here
         stale = [p for p in paths_to_trajectories if not is_current(p)]
@@ -101,6 +105,7 @@ class PoseGraphDataset(Dataset):
         self.random_points = random_points
         self.closure_dropout = closure_dropout
         self.pose_noise = (np.radians(pose_noise_deg), pose_noise_m)   # TransformerSolverConfig.pose_noise_*
+        self.augment = augment   # its depth_* / odom_* / world_* fields; None for val
 
     def __len__(self) -> int:
         return len(self.sample_paths)
@@ -140,10 +145,17 @@ class PoseGraphDataset(Dataset):
             # None when off: no (V, P, D) zeros allocated and padded for nothing
             descriptors = ((torch.from_numpy(self._descriptors(index, keep)) if self._has_descriptors(index)
                             else torch.zeros(descriptor_shape, dtype=torch.float16)) if self.pass_descriptor else None)
+            odometry_aug = None
+            if self.augment is not None:
+                data = dict(data)
+                descriptors, odometry_aug = augment(data, keep, descriptors, self.augment)
             if any(self.pose_noise):
                 data = dict(data)   # the input poses change, so do the targets model_item derives from them
                 data['poses'] = perturb_poses(data['poses'], *self.pose_noise)
-            return model_item(data, keep, descriptors, self.closure_dropout)
+            item = model_item(data, keep, descriptors, self.closure_dropout)
+            if odometry_aug is not None:   # not in MODEL_INPUTS: a label, never seen by the model
+                item['odometry_aug'] = odometry_aug
+            return item
 
 
 def perturb_poses(poses: np.ndarray, rot_rad: float, trans_m: float) -> np.ndarray:
@@ -156,3 +168,144 @@ def perturb_poses(poses: np.ndarray, rot_rad: float, trans_m: float) -> np.ndarr
     D[:, :3, :3] = Rotation.from_rotvec(rv.numpy()).as_matrix()
     D[:, :3, 3] = tv.numpy()
     return poses @ D
+
+
+# Load-time augmentation (TransformerSolverConfig's depth_* / odom_* / world_*). torch's RNG throughout, as
+# perturb_poses, and nothing drawn by a step that is off: with everything off an item is bit-identical.
+
+def _randn(*shape) -> np.ndarray:
+    return torch.randn(shape, dtype=torch.float64).numpy()
+
+
+def _rand(*shape) -> np.ndarray:
+    return torch.rand(shape, dtype=torch.float64).numpy()
+
+
+def _random_vectors(n: int, lo: float, hi: float) -> np.ndarray:
+    """(n, 3): uniform directions (normalised Gaussian), lengths U(lo, hi)."""
+    v = _randn(n, 3)
+    return v / np.linalg.norm(v, axis=1, keepdims=True) * (lo + (hi - lo) * _rand(n, 1))
+
+
+def _transforms(rotvec: np.ndarray, t: np.ndarray) -> np.ndarray:
+    """(n, 4, 4) [Exp(rotvec) | t]: SO(3) x R^3, as delta_targets encodes, not the SE(3) Exp."""
+    T = np.tile(np.eye(4), (len(rotvec), 1, 1))
+    T[:, :3, :3] = Rotation.from_rotvec(rotvec).as_matrix()
+    T[:, :3, 3] = t
+    return T
+
+
+def augment_points(points: np.ndarray, descriptors: Optional[Tensor], cfg: TransformerSolverConfig
+                   ) -> tuple[np.ndarray, Optional[Tensor]]:
+    """
+    (V, P, 3) camera-frame points through a depth-sensor model, same shape and dtype; descriptors
+    (V, P, D) rows follow their point. Holes first (copies, so a copy still gets its own noise), then
+    z' = z + N(0, s0 + s1 z^2), then flying pixels. Along the ray: p' = p z'/z, z the planar depth.
+    z <= 0 is sample_points' empty keyframe: left alone, never a copy source.
+    """
+    p = points.astype(np.float64)
+    V, P, _ = p.shape
+    valid = p[..., 2] > 0
+    if cfg.depth_hole_fraction:
+        hole = (_rand(V, P) < cfg.depth_hole_fraction) & valid
+        for v in np.nonzero(hole.any(axis=1))[0]:
+            source = np.nonzero(valid[v] & ~hole[v])[0]
+            if len(source) == 0:
+                continue
+            dst = np.nonzero(hole[v])[0]
+            src = source[torch.randint(len(source), (len(dst),)).numpy()]
+            p[v, dst] = p[v, src]
+            if descriptors is not None:
+                descriptors[v, torch.from_numpy(dst)] = descriptors[v, torch.from_numpy(src)]
+    z = np.where(valid, p[..., 2], 1.0)
+    z_new = z.copy()
+    if cfg.depth_noise_s0 or cfg.depth_noise_s1:
+        # floor 1 cm: never through the camera (sigma at 5 m is 5.5 cm with the suggested values)
+        z_new = np.maximum(z + (cfg.depth_noise_s0 + cfg.depth_noise_s1 * z ** 2) * _randn(V, P), 0.01)
+    if cfg.depth_flying_fraction:
+        fly = _rand(V, P) < cfg.depth_flying_fraction
+        z_max = np.maximum(np.where(valid, z, 0).max(axis=1, keepdims=True), 0.2)
+        z_new = np.where(fly, 0.2 + (z_max - 0.2) * _rand(V, P), z_new)
+    p *= np.where(valid, z_new / z, 1.0)[..., None]
+    return p.astype(points.dtype), descriptors
+
+
+def augment_odometry(Z: np.ndarray, info: np.ndarray, cfg: TransformerSolverConfig
+                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    (O, 4, 4) odometry Z and (O, 6, 6) information after noise, break and dropout, plus (O,) int8 per edge:
+    0 untouched by break/dropout, 1 broken, 2 hidden. Dropout's constant-velocity guess is the previous
+    edge's Z as already augmented, so a run of hidden edges repeats one motion.
+    """
+    Z, info = Z.copy(), info.copy()
+    O = len(Z)
+    code = np.zeros(O, dtype=np.int8)
+    if cfg.odom_noise_deg or cfg.odom_noise_m:
+        Z = Z @ _transforms(_randn(O, 3) * np.radians(cfg.odom_noise_deg), _randn(O, 3) * cfg.odom_noise_m)
+    if cfg.odom_outlier_prob:
+        hit = _rand(O) < cfg.odom_outlier_prob
+        n = int(hit.sum())
+        Z[hit] = Z[hit] @ _transforms(
+            _random_vectors(n, np.radians(cfg.odom_outlier_deg_min), np.radians(cfg.odom_outlier_deg_max)),
+            _random_vectors(n, cfg.odom_outlier_m_min, cfg.odom_outlier_m_max))
+    if cfg.odom_break_prob and O > 1 and _rand() < cfg.odom_break_prob:
+        e = 1 + int(torch.randint(O - 1, ()))
+        Z[e] = Z[e] @ _transforms(
+            _random_vectors(1, np.radians(cfg.odom_break_deg_min), np.radians(cfg.odom_break_deg_max)),
+            _random_vectors(1, 0.0, cfg.odom_break_m))[0]
+        info[e], code[e] = UNKNOWN_INFO, 1
+    if cfg.odom_dropout:
+        hidden = _rand(O) < cfg.odom_dropout
+        hidden[0] = False
+        for e in np.nonzero(hidden)[0]:
+            Z[e], info[e], code[e] = Z[e - 1], UNKNOWN_INFO, 2
+    return Z, info, code
+
+
+def chain_poses(poses: np.ndarray, ij: np.ndarray, Z: np.ndarray) -> np.ndarray:
+    """(V, 4, 4) T_j = T_i Z_ij in edge order, vertex 0 (and any vertex no edge reaches) as given."""
+    T = poses.copy()
+    for (i, j), z in zip(ij, Z):
+        T[j] = T[i] @ z
+    return T
+
+
+def world_transform(cfg: TransformerSolverConfig) -> np.ndarray:
+    """(4, 4) G for world_rotation / world_translation_m."""
+    if cfg.world_rotation == "so3":
+        q = _randn(4)   # a normalised 4-D Gaussian is a uniform unit quaternion: Haar on SO(3)
+        R = Rotation.from_quat(q / np.linalg.norm(q)).as_matrix()
+    elif cfg.world_rotation == "yaw":
+        R = Rotation.from_rotvec([0.0, 2 * np.pi * _rand(), 0.0]).as_matrix()
+    elif cfg.world_rotation == "none":
+        R = np.eye(3)
+    else:
+        raise ValueError(f"world_rotation {cfg.world_rotation!r}: none | yaw | so3")
+    G = np.eye(4)
+    G[:3, :3] = R
+    if cfg.world_translation_m:
+        G[:3, 3] = cfg.world_translation_m * (2 * _rand(3) - 1)
+    return G
+
+
+def augment(data: dict, keep: slice, descriptors: Optional[Tensor], cfg: TransformerSolverConfig
+            ) -> tuple[Optional[Tensor], Optional[np.ndarray]]:
+    """
+    data (sample.npz as a dict) augmented in place for model_item: points (the kept window only), odometry,
+    poses re-chained from the augmented odometry, then G on poses and gt_poses. Closures untouched. Returns
+    the descriptors (rows moved with the hole copies) and, when break or dropout is on, the (O,) odometry_aug
+    codes as a tensor. Pose noise (perturb_poses) comes after, on the re-chained poses: G T Exp = G (T Exp).
+    """
+    if cfg.depth_noise_s0 or cfg.depth_noise_s1 or cfg.depth_hole_fraction or cfg.depth_flying_fraction:
+        points = data['points'].copy()
+        points[:, keep], descriptors = augment_points(points[:, keep], descriptors, cfg)
+        data['points'] = points
+    code = None
+    if cfg.odom_noise_deg or cfg.odom_noise_m or cfg.odom_outlier_prob or cfg.odom_break_prob or cfg.odom_dropout:
+        data['odometry_Z'], data['odometry_info'], code = augment_odometry(data['odometry_Z'], data['odometry_info'], cfg)
+        data['poses'] = chain_poses(data['poses'], data['odometry_ij'], data['odometry_Z'])
+    if cfg.world_rotation != "none" or cfg.world_translation_m:
+        G = world_transform(cfg)
+        data['poses'], data['gt_poses'] = G @ data['poses'], G @ data['gt_poses']
+    labelled = cfg.odom_break_prob or cfg.odom_dropout
+    return descriptors, (torch.from_numpy(code) if labelled else None)

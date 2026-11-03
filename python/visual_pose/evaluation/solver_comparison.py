@@ -74,7 +74,7 @@ def refine(model: nn.Module, batch: dict, T_in: np.ndarray, cfg: TransformerSolv
     V = len(T_in)
     T, delta_max = T_in, 0.0
     for _ in range(cfg.refinement_iterations):
-        delta = model(**model_input(batch, cfg.rotate_points))[0, :V].cpu().double().numpy()
+        delta = model(**model_input(batch, cfg.rotate_points))[0][0, :V].cpu().double().numpy()
         T = np.stack([T[v] @ correction(delta[v]) for v in range(V)])
         # model sees the float32 of the float64 T; trans_step compounds in float32 instead
         batch["poses"][0, :V] = torch.from_numpy(T[:, :3].reshape(V, 12)).to(batch["poses"])

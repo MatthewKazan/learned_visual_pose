@@ -124,7 +124,7 @@ def trans_step(model: nn.Module, batch: dict[str, Tensor], cfg: TransformerSolve
         # like RAFT). Memory ~ refinement_iterations passes; evaluation still takes the path below.
         loss = None
         for _ in range(cfg.refinement_iterations):
-            pred = model(**model_input(batch, cfg.rotate_points))   # (B, V, 6)
+            pred, _ = model(**model_input(batch, cfg.rotate_points))   # (B, V, 6)
             loss = loss + pose_loss(pred, batch, cfg) if loss is not None else pose_loss(pred, batch, cfg)
             batch['poses'] = update_graph_with_tangent_delta(batch['poses'], pred)
             batch['delta_target_mat'], batch['delta_target'] = update_ground_truth_residual(batch['poses'], batch['gt_poses'])
@@ -135,12 +135,12 @@ def trans_step(model: nn.Module, batch: dict[str, Tensor], cfg: TransformerSolve
     model.eval()
     with torch.no_grad():
         for _ in range(k):
-            pred = model(**model_input(batch, cfg.rotate_points))   # (B, V, 6)
+            pred, _ = model(**model_input(batch, cfg.rotate_points))   # (B, V, 6)
             batch['poses'] = update_graph_with_tangent_delta(batch['poses'], pred)
             batch['delta_target_mat'], batch['delta_target'] = update_ground_truth_residual(batch['poses'], batch['gt_poses'])
     if train:
         model.train()
-    pred = model(**model_input(batch, cfg.rotate_points))  # (B, V, 6)
+    pred, _ = model(**model_input(batch, cfg.rotate_points))  # (B, V, 6)
     return pose_loss(pred, batch, cfg)
 
 
